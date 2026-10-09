@@ -36,3 +36,12 @@ ls /tmp/proof.txt # exists
 sudo reboot
 ssh server
 ls /tmp/proof.txt # not found - RAM wiped
+
+
+## Warrant Canary — Nimbuzz QuantVPN
+
+**As of 2026-10-09:** No warrants, no searches, no gag orders.
+
+**Next update:** 2026-11-09
+
+**Signed:** Nimbuzz Team
