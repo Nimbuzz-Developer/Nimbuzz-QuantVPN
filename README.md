@@ -36,7 +36,7 @@ ls /tmp/proof.txt # exists
 sudo reboot
 ssh server
 ls /tmp/proof.txt # not found - RAM wiped
-
+```
 
 ## Warrant Canary — Nimbuzz QuantVPN
 
