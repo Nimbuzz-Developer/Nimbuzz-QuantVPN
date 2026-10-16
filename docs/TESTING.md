@@ -24,6 +24,11 @@ The automated test suite (`crypto/crypto_test.go`) covers cryptographic correctn
 | `TestRFC8439_ChaCha20Poly1305_KAT` | Official RFC 8439 Section 2.8.2 KAT with literal ciphertext & tag | RFC 8439 reference compliance |
 | `TestChaCha20Poly1305_RoundTrip` | Deterministic AEAD seal/open round-trip check | AEAD seal/open correctness |
 | `TestAuthenticatedProvisioning` | End-to-end client identity authentication, signing, and contextual AAD tamper detection | MitM key substitution & session tampering protection |
+| `TestProvisionContext_Validation` | Context validation: non-empty IDs, non-zero nonce, past/future clock skew bounds | Freshness window & structural context validation |
+| `TestNonceCache_ReplayPrevention` | Replay cache checking, duplicate nonce rejection, and lazy TTL eviction | Replay detection & single-use nonce enforcement |
+| `TestKeyLengthValidationInSignVerify` | Strict length validation of ML-KEM and Ed25519 keys in Sign/Verify functions | Input parameter bounds & type safety |
+| `TestUnifiedProvisioningFlow` | Unified atomic ProvisionPSK and ConsumeProvisionedPSK flows under valid/stale/bad sig inputs | Atomic API security & caller error prevention |
+| `TestDeprecatedNoContextAPI` | Functional verification of deprecated/no-context fallback primitives | Backward compatibility |
 | `TestZeroization` | Scrubbing sensitive memory buffers with `Zeroize()` | Sensitive buffer cleanup in RAM |
 | `TestConcurrency` | 20 parallel worker goroutines running 50 iterations each | Thread safety under concurrent load |
 | `BenchmarkGenerateEncryptedPSK` | Throughput of server-side PSK encapsulation | Server encapsulation throughput |
@@ -71,13 +76,23 @@ go test -v ./...
 === RUN   TestChaCha20Poly1305_RoundTrip
 --- PASS: TestChaCha20Poly1305_RoundTrip (0.00s)
 === RUN   TestAuthenticatedProvisioning
---- PASS: TestAuthenticatedProvisioning (0.00s)
+--- PASS: TestAuthenticatedProvisioning (0.01s)
+=== RUN   TestProvisionContext_Validation
+--- PASS: TestProvisionContext_Validation (0.00s)
+=== RUN   TestNonceCache_ReplayPrevention
+--- PASS: TestNonceCache_ReplayPrevention (0.00s)
+=== RUN   TestKeyLengthValidationInSignVerify
+--- PASS: TestKeyLengthValidationInSignVerify (0.00s)
+=== RUN   TestUnifiedProvisioningFlow
+--- PASS: TestUnifiedProvisioningFlow (0.00s)
+=== RUN   TestDeprecatedNoContextAPI
+--- PASS: TestDeprecatedNoContextAPI (0.00s)
 === RUN   TestZeroization
 --- PASS: TestZeroization (0.00s)
 === RUN   TestConcurrency
---- PASS: TestConcurrency (0.03s)
+--- PASS: TestConcurrency (0.04s)
 PASS
-ok      nimbuzz.com/mlkem-psk/crypto    0.496s
+ok      nimbuzz.com/mlkem-psk/crypto    0.681s
 ```
 
 ### 2.3 Running Concurrency & Race Detector

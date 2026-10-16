@@ -241,7 +241,22 @@ ML-KEM protects confidentiality for the intended private-key holder, but does no
 3. The server and client bind the session context into the ChaCha20-Poly1305 AAD (`BuildAuthenticatedAAD`).
 If any attacker tampers with the public key, the Ed25519 signature verification fails. If any attacker tampers with the server identity, client identity, or session nonce, ChaCha20-Poly1305 AEAD decryption fails (`ErrDecryptionFailed`).
 
-### 7.3 Memory Hygiene & Zeroization
+### 7.3 Freshness Window & Anti-Replay Protection
+AAD binding guarantees tamper-evidence and prevents cross-session or cross-peer mixups. However, cryptographic AAD binding alone does not prevent an attacker from replaying an entire recorded `(blob, ctx)` pair.
+To prevent replay attacks and PSK rollback (reinstating an expired or compromised key):
+1. **Clock Skew & Window Validation:** The receiver calls `ctx.Validate(now, maxSkew)` (defaulting to 5 minutes). Timestamps outside this window are rejected with `ErrStaleTimestamp`.
+2. **Session Nonce Tracking:** Receivers maintain a thread-safe `NonceCache` (or use receiver-issued challenges). If a nonce is presented more than once within the expiration window, it is rejected with `ErrReplayDetected`.
+3. **Non-Zero Nonces:** Zero-value nonces are explicitly rejected with `ErrZeroNonce`.
+
+### 7.4 Unified Entry Points & Inseparable Authentication
+To eliminate integration vulnerabilities where a caller might verify one key/context but encrypt with another, or skip verification entirely:
+- **Server:** `ProvisionPSK(clientEdPub, clientMLKEMPub, sig, ctx)` combines context validation, key length checks, Ed25519 signature verification, and ML-KEM encapsulation into an atomic call.
+- **Client:** `ConsumeProvisionedPSK(blob, dk, ctx)` enforces context freshness validation before performing decapsulation and AEAD opening.
+
+### 7.5 API Hardening & Deprecation of Context-less Primitives
+The raw, context-less primitives (`EncryptPSK`, `DecryptPSK`, `GenerateEncryptedPSK`) are marked `// Deprecated:` and redirected to `*NoContext` variants with explicit security warnings. These lack identity binding and replay resistance and must not be used for production tunnel provisioning.
+
+### 7.6 Memory Hygiene & Zeroization
 All intermediate cryptographic secrets and wire secrets are scrubbed from RAM immediately after use:
 - The ML-KEM shared secret `ss_kem` is zeroized using `defer Zeroize(sharedSecret)`.
 - The derived HKDF symmetric key `K_aead` is zeroized using `defer Zeroize(key)`.

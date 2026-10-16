@@ -51,7 +51,11 @@ func main() {
 		Timestamp:    time.Now().Unix(),
 	}
 
-	clientSig := crypto.SignClientKey(clientPriv, mlkemPub, ctx)
+	clientSig, err := crypto.SignClientKey(clientPriv, mlkemPub, ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to sign ML-KEM key: %v\n", err)
+		os.Exit(1)
+	}
 
 	fmt.Printf("[1] Client generated keys and signed context in %v\n", time.Since(t0))
 	fmt.Printf("    Client ID:        %s\n", ctx.ClientID)
@@ -59,22 +63,17 @@ func main() {
 	fmt.Printf("    ML-KEM-1024 key:  %d bytes public, %d bytes private\n", len(mlkemPub), len(dk.Bytes()))
 	fmt.Printf("    Session context:  server=%s, nonce=%x...\n", ctx.ServerID, sessionNonce[:6])
 
-	// 2. Server verifies client signature before provisioning
+	// 2. Server provisions PSK via unified entry point (validates freshness, verifies Ed25519 signature, encapsulates PSK)
 	t1 := time.Now()
-	if err := crypto.VerifyClientKey(clientPub, mlkemPub, ctx, clientSig); err != nil {
-		fmt.Fprintf(os.Stderr, "server rejected client authentication: %v\n", err)
-		os.Exit(1)
-	}
-
-	psk, blob, err := crypto.GenerateEncryptedPSKWithContext(mlkemPub, ctx)
+	psk, blob, err := crypto.ProvisionPSK(clientPub, mlkemPub, clientSig, ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to encrypt PSK: %v\n", err)
+		fmt.Fprintf(os.Stderr, "server provisioning failed: %v\n", err)
 		os.Exit(1)
 	}
 	defer crypto.Zeroize(psk[:])
 
 	serverFP := sha256.Sum256(psk[:])
-	fmt.Printf("\n[2] Server verified client and encrypted PSK in %v\n", time.Since(t1))
+	fmt.Printf("\n[2] Server authenticated client and provisioned PSK in %v\n", time.Since(t1))
 	fmt.Printf("    Server PSK:       [REDACTED] (SHA-256: %x...)\n", serverFP[:8])
 	fmt.Printf("    Blob size:        %d bytes\n", len(blob))
 	fmt.Printf("    - Version:        0x%02x (1 byte)\n", blob[0])
@@ -82,11 +81,11 @@ func main() {
 	fmt.Printf("    - Nonce:          %d bytes\n", crypto.NonceSize)
 	fmt.Printf("    - Tagged PSK:     %d bytes (ChaCha20-Poly1305)\n", crypto.PSKSize+crypto.Poly1305TagSize)
 
-	// 3. Client decrypts and verifies the context-bound envelope
+	// 3. Client consumes provisioned PSK via unified entry point (validates freshness, verifies context AAD, decrypts PSK)
 	t2 := time.Now()
-	recoveredPSK, err := crypto.DecryptPSKWithContext(blob, dk, ctx)
+	recoveredPSK, err := crypto.ConsumeProvisionedPSK(blob, dk, ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to decrypt PSK: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to consume provisioned PSK: %v\n", err)
 		os.Exit(1)
 	}
 	defer crypto.Zeroize(recoveredPSK[:])
@@ -108,15 +107,15 @@ func main() {
 	fmt.Println("PresharedKey = [REDACTED - 32 bytes provisioned via ML-KEM-1024 into kernel]")
 
 	if *benchFlag {
-		fmt.Println("\nRunning benchmark (1,000 round-trips with authenticated context)...")
+		fmt.Println("\nRunning benchmark (1,000 round-trips with ProvisionPSK + ConsumeProvisionedPSK)...")
 		benchStart := time.Now()
 		const iterations = 1000
 		for i := 0; i < iterations; i++ {
-			bPSK, bBlob, bErr := crypto.GenerateEncryptedPSKWithContext(mlkemPub, ctx)
+			bPSK, bBlob, bErr := crypto.ProvisionPSK(clientPub, mlkemPub, clientSig, ctx)
 			if bErr != nil {
 				panic(bErr)
 			}
-			bRec, bErr := crypto.DecryptPSKWithContext(bBlob, dk, ctx)
+			bRec, bErr := crypto.ConsumeProvisionedPSK(bBlob, dk, ctx)
 			if bErr != nil || subtle.ConstantTimeCompare(bRec[:], bPSK[:]) != 1 {
 				panic("benchmark mismatch")
 			}

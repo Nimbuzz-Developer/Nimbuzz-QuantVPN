@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
+	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -38,25 +40,103 @@ const (
 
 	// Domain separation string used for HKDF key derivation.
 	KDFLabel = "wireguard-psk/encrypt/mlkem1024/v1"
+
+	// DefaultMaxClockSkew is the maximum allowable difference between context timestamp and receiver clock.
+	DefaultMaxClockSkew = 5 * time.Minute
 )
 
 var (
 	ErrBadBlobSize          = errors.New("crypto: invalid encrypted PSK blob size")
 	ErrUnsupportedVersion   = errors.New("crypto: unsupported blob format version")
-	ErrDecryptionFailed     = errors.New("crypto: decryption failed: wrong key or corrupted blob")
+	ErrDecryptionFailed     = errors.New("crypto: decryption failed: wrong key, corrupted blob, or context mismatch")
 	ErrInvalidDecryptedSize = errors.New("crypto: invalid decrypted PSK length")
 	ErrInvalidPublicKeySize = errors.New("crypto: invalid ML-KEM-1024 public key size")
 	ErrClientAuthFailed     = errors.New("crypto: client identity signature verification failed")
 	ErrInvalidSignatureSize = errors.New("crypto: invalid signature size")
+	ErrStaleTimestamp       = errors.New("crypto: timestamp is expired or outside allowable clock skew")
+	ErrZeroNonce            = errors.New("crypto: session nonce must be non-zero")
+	ErrEmptyIdentity        = errors.New("crypto: client and server identity strings must not be empty")
+	ErrReplayDetected       = errors.New("crypto: session nonce replay detected")
 )
 
-// ProvisionContext binds a PSK exchange to specific identities and a fresh session.
-// This prevents man-in-the-middle key substitution, replays, and session mixups.
+// ProvisionContext binds a PSK exchange to specific client and server identities.
+// Binding this context into the ChaCha20-Poly1305 AAD ensures tamper-evidence and prevents
+// cross-session or cross-peer mixups.
+//
+// NOTE ON FRESHNESS & REPLAY:
+// Cryptographic AAD binding guarantees tamper-evidence and identity binding, but does NOT by itself
+// enforce freshness or prevent replay if an attacker replays a valid (blob, ctx) pair.
+// To guarantee freshness and prevent replay (e.g. PSK rollback), the receiver must:
+//  1. Validate timestamp freshness via ctx.Validate(now, maxSkew).
+//  2. Enforce session nonce uniqueness via NonceCache or a receiver-issued challenge nonce.
 type ProvisionContext struct {
 	ClientID     string   // Unique client identity (e.g. client ID or pubkey fingerprint)
 	ServerID     string   // Designated server identity (e.g. "data-plane-fra1-1")
-	SessionNonce [16]byte // Freshness nonce to guarantee per-session uniqueness
-	Timestamp    int64    // Unix timestamp (seconds) for freshness validation
+	SessionNonce [16]byte // Freshness nonce (must be non-zero and unique per session)
+	Timestamp    int64    // Unix timestamp (seconds)
+}
+
+// Validate checks that the context contains non-empty identities, a non-zero session nonce,
+// and a timestamp that falls within maxSkew of the given reference time.
+func (c ProvisionContext) Validate(now time.Time, maxSkew time.Duration) error {
+	if c.ClientID == "" || c.ServerID == "" {
+		return ErrEmptyIdentity
+	}
+
+	var zeroNonce [16]byte
+	if c.SessionNonce == zeroNonce {
+		return ErrZeroNonce
+	}
+
+	if maxSkew <= 0 {
+		maxSkew = DefaultMaxClockSkew
+	}
+
+	ts := time.Unix(c.Timestamp, 0)
+	diff := now.Sub(ts)
+	if diff < -maxSkew || diff > maxSkew {
+		return fmt.Errorf("%w: timestamp %v differs from now %v by %v (max skew %v)",
+			ErrStaleTimestamp, ts, now, diff, maxSkew)
+	}
+
+	return nil
+}
+
+// NonceCache provides thread-safe in-memory tracking of seen session nonces
+// to enforce single-use and prevent replay attacks within the freshness window.
+type NonceCache struct {
+	mu      sync.Mutex
+	entries map[[16]byte]time.Time
+}
+
+// NewNonceCache initializes a new in-memory replay cache.
+func NewNonceCache() *NonceCache {
+	return &NonceCache{
+		entries: make(map[[16]byte]time.Time),
+	}
+}
+
+// CheckAndAdd verifies that a session nonce has not been seen. If unseen, it records it
+// with an expiration time after which it is eligible for eviction. If already seen and not
+// expired, it returns ErrReplayDetected.
+func (nc *NonceCache) CheckAndAdd(nonce [16]byte, expiry time.Time) error {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+
+	now := time.Now()
+	// Lazy eviction of expired entries
+	for k, exp := range nc.entries {
+		if now.After(exp) {
+			delete(nc.entries, k)
+		}
+	}
+
+	if exp, exists := nc.entries[nonce]; exists && now.Before(exp) {
+		return ErrReplayDetected
+	}
+
+	nc.entries[nonce] = expiry
+	return nil
 }
 
 // BuildAuthenticatedAAD creates additional authenticated data (AAD) for ChaCha20-Poly1305.
@@ -109,13 +189,26 @@ func ClientSignaturePayload(mlkemPubKey []byte, ctx ProvisionContext) []byte {
 }
 
 // SignClientKey signs the client's ML-KEM public key and session context using an Ed25519 identity key.
-func SignClientKey(priv ed25519.PrivateKey, mlkemPubKey []byte, ctx ProvisionContext) []byte {
+// It validates that mlkemPubKey is exactly EncapsulationKeySize1024 bytes.
+func SignClientKey(priv ed25519.PrivateKey, mlkemPubKey []byte, ctx ProvisionContext) ([]byte, error) {
+	if len(mlkemPubKey) != mlkem.EncapsulationKeySize1024 {
+		return nil, fmt.Errorf("%w: want %d bytes, got %d",
+			ErrInvalidPublicKeySize, mlkem.EncapsulationKeySize1024, len(mlkemPubKey))
+	}
 	payload := ClientSignaturePayload(mlkemPubKey, ctx)
-	return ed25519.Sign(priv, payload)
+	return ed25519.Sign(priv, payload), nil
 }
 
 // VerifyClientKey validates that the ML-KEM public key was signed by clientPubKey for this context.
+// It validates key lengths and verifies the Ed25519 signature.
 func VerifyClientKey(clientPubKey ed25519.PublicKey, mlkemPubKey []byte, ctx ProvisionContext, sig []byte) error {
+	if len(mlkemPubKey) != mlkem.EncapsulationKeySize1024 {
+		return fmt.Errorf("%w: want %d bytes, got %d",
+			ErrInvalidPublicKeySize, mlkem.EncapsulationKeySize1024, len(mlkemPubKey))
+	}
+	if len(clientPubKey) != ed25519.PublicKeySize {
+		return errors.New("crypto: invalid ed25519 public key size")
+	}
 	if len(sig) != ed25519.SignatureSize {
 		return ErrInvalidSignatureSize
 	}
@@ -126,28 +219,33 @@ func VerifyClientKey(clientPubKey ed25519.PublicKey, mlkemPubKey []byte, ctx Pro
 	return nil
 }
 
+// ProvisionPSK is the unified server-side entry point that authenticates the client's ML-KEM
+// public key, verifies context freshness/structure, and generates an encrypted PSK bound to the context.
+// Tying signature verification directly to encryption prevents separating or mis-pairing the keys or context.
+func ProvisionPSK(clientEdPub ed25519.PublicKey, clientMLKEMPub []byte, sig []byte, ctx ProvisionContext) ([PSKSize]byte, []byte, error) {
+	if err := ctx.Validate(time.Now(), DefaultMaxClockSkew); err != nil {
+		return [PSKSize]byte{}, nil, fmt.Errorf("validate context: %w", err)
+	}
+	if err := VerifyClientKey(clientEdPub, clientMLKEMPub, ctx, sig); err != nil {
+		return [PSKSize]byte{}, nil, fmt.Errorf("verify client key: %w", err)
+	}
+	return GenerateEncryptedPSKWithContext(clientMLKEMPub, ctx)
+}
+
+// ConsumeProvisionedPSK is the unified client-side entry point that validates context freshness
+// and unwraps the encrypted PSK blob, verifying the AEAD tag against the session context.
+func ConsumeProvisionedPSK(blob []byte, dk *mlkem.DecapsulationKey1024, ctx ProvisionContext) ([PSKSize]byte, error) {
+	if err := ctx.Validate(time.Now(), DefaultMaxClockSkew); err != nil {
+		return [PSKSize]byte{}, fmt.Errorf("validate context: %w", err)
+	}
+	return DecryptPSKWithContext(blob, dk, ctx)
+}
+
 // Zeroize wipes byte slices so sensitive data doesn't linger in memory.
 func Zeroize(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
-}
-
-// GenerateEncryptedPSK generates a random 32-byte WireGuard PSK and encrypts it
-// using the recipient's ML-KEM-1024 public key.
-func GenerateEncryptedPSK(recipientPubKey []byte) ([PSKSize]byte, []byte, error) {
-	psk, err := GeneratePSK()
-	if err != nil {
-		return psk, nil, fmt.Errorf("generate psk: %w", err)
-	}
-
-	encrypted, err := EncryptPSK(psk, recipientPubKey)
-	if err != nil {
-		Zeroize(psk[:])
-		return [PSKSize]byte{}, nil, fmt.Errorf("encrypt psk: %w", err)
-	}
-
-	return psk, encrypted, nil
 }
 
 // GenerateEncryptedPSKWithContext generates a random 32-byte WireGuard PSK and encrypts it
@@ -167,9 +265,53 @@ func GenerateEncryptedPSKWithContext(recipientPubKey []byte, ctx ProvisionContex
 	return psk, encrypted, nil
 }
 
-// EncryptPSK encrypts an existing 32-byte WireGuard PSK to the recipient's ML-KEM-1024 public key.
-// It encapsulates a shared secret, derives a symmetric key using HKDF-SHA256, and seals the PSK with ChaCha20-Poly1305.
-func EncryptPSK(psk [PSKSize]byte, recipientPubKey []byte) ([]byte, error) {
+// EncryptPSKWithContext encrypts an existing 32-byte WireGuard PSK to the recipient's ML-KEM-1024 public key,
+// cryptographically binding the session context into the ChaCha20-Poly1305 AEAD tag.
+func EncryptPSKWithContext(psk [PSKSize]byte, recipientPubKey []byte, ctx ProvisionContext) ([]byte, error) {
+	return encryptPSKInternal(psk, recipientPubKey, func(kemCT []byte) []byte {
+		return BuildAuthenticatedAAD(ctx, kemCT)
+	})
+}
+
+// DecryptPSKWithContext unwraps an encrypted PSK blob and validates the session context in the AEAD tag.
+func DecryptPSKWithContext(blob []byte, dk *mlkem.DecapsulationKey1024, ctx ProvisionContext) ([PSKSize]byte, error) {
+	return decryptPSKInternal(blob, dk, func(kemCT []byte) []byte {
+		return BuildAuthenticatedAAD(ctx, kemCT)
+	})
+}
+
+// GenerateEncryptedPSKNoContext generates a random 32-byte WireGuard PSK and encrypts it
+// using the recipient's ML-KEM-1024 public key WITHOUT client identity binding or session context.
+//
+// WARNING: This function provides NO client identity authentication and NO replay protection.
+// Use ProvisionPSK or GenerateEncryptedPSKWithContext for secure tunnel provisioning.
+func GenerateEncryptedPSKNoContext(recipientPubKey []byte) ([PSKSize]byte, []byte, error) {
+	psk, err := GeneratePSK()
+	if err != nil {
+		return psk, nil, fmt.Errorf("generate psk: %w", err)
+	}
+
+	encrypted, err := EncryptPSKNoContext(psk, recipientPubKey)
+	if err != nil {
+		Zeroize(psk[:])
+		return [PSKSize]byte{}, nil, fmt.Errorf("encrypt psk: %w", err)
+	}
+
+	return psk, encrypted, nil
+}
+
+// Deprecated: GenerateEncryptedPSK provides NO client identity authentication and NO replay
+// protection, making it vulnerable to public key substitution attacks. Use ProvisionPSK instead.
+func GenerateEncryptedPSK(recipientPubKey []byte) ([PSKSize]byte, []byte, error) {
+	return GenerateEncryptedPSKNoContext(recipientPubKey)
+}
+
+// EncryptPSKNoContext encrypts an existing 32-byte WireGuard PSK to the recipient's ML-KEM-1024
+// public key WITHOUT identity binding or session context.
+//
+// WARNING: This function provides NO client identity authentication and NO replay protection.
+// Use EncryptPSKWithContext or ProvisionPSK instead.
+func EncryptPSKNoContext(psk [PSKSize]byte, recipientPubKey []byte) ([]byte, error) {
 	return encryptPSKInternal(psk, recipientPubKey, func(kemCT []byte) []byte {
 		aad := make([]byte, 1+len(kemCT))
 		aad[0] = FormatVersion
@@ -178,12 +320,29 @@ func EncryptPSK(psk [PSKSize]byte, recipientPubKey []byte) ([]byte, error) {
 	})
 }
 
-// EncryptPSKWithContext encrypts an existing 32-byte WireGuard PSK to the recipient's ML-KEM-1024 public key,
-// cryptographically binding the session context into the ChaCha20-Poly1305 AEAD tag.
-func EncryptPSKWithContext(psk [PSKSize]byte, recipientPubKey []byte, ctx ProvisionContext) ([]byte, error) {
-	return encryptPSKInternal(psk, recipientPubKey, func(kemCT []byte) []byte {
-		return BuildAuthenticatedAAD(ctx, kemCT)
+// Deprecated: EncryptPSK provides NO client identity authentication and NO replay protection.
+// Use EncryptPSKWithContext instead.
+func EncryptPSK(psk [PSKSize]byte, recipientPubKey []byte) ([]byte, error) {
+	return EncryptPSKNoContext(psk, recipientPubKey)
+}
+
+// DecryptPSKNoContext unwraps an encrypted PSK blob WITHOUT verifying identity binding or session context.
+//
+// WARNING: This function does not verify caller identity or freshness. Use ConsumeProvisionedPSK
+// or DecryptPSKWithContext instead.
+func DecryptPSKNoContext(blob []byte, dk *mlkem.DecapsulationKey1024) ([PSKSize]byte, error) {
+	return decryptPSKInternal(blob, dk, func(kemCT []byte) []byte {
+		aad := make([]byte, 1+len(kemCT))
+		aad[0] = FormatVersion
+		copy(aad[1:], kemCT)
+		return aad
 	})
+}
+
+// Deprecated: DecryptPSK does not verify caller identity or freshness.
+// Use ConsumeProvisionedPSK or DecryptPSKWithContext instead.
+func DecryptPSK(blob []byte, dk *mlkem.DecapsulationKey1024) ([PSKSize]byte, error) {
+	return DecryptPSKNoContext(blob, dk)
 }
 
 func encryptPSKInternal(psk [PSKSize]byte, recipientPubKey []byte, aadFn func(kemCT []byte) []byte) ([]byte, error) {
@@ -232,23 +391,6 @@ func encryptPSKInternal(psk [PSKSize]byte, recipientPubKey []byte, aadFn func(ke
 	out = append(out, ciphertext...)
 
 	return out, nil
-}
-
-// DecryptPSK unwraps an encrypted PSK blob using the recipient's ML-KEM-1024 private key.
-func DecryptPSK(blob []byte, dk *mlkem.DecapsulationKey1024) ([PSKSize]byte, error) {
-	return decryptPSKInternal(blob, dk, func(kemCT []byte) []byte {
-		aad := make([]byte, 1+len(kemCT))
-		aad[0] = FormatVersion
-		copy(aad[1:], kemCT)
-		return aad
-	})
-}
-
-// DecryptPSKWithContext unwraps an encrypted PSK blob and validates the session context in the AEAD tag.
-func DecryptPSKWithContext(blob []byte, dk *mlkem.DecapsulationKey1024, ctx ProvisionContext) ([PSKSize]byte, error) {
-	return decryptPSKInternal(blob, dk, func(kemCT []byte) []byte {
-		return BuildAuthenticatedAAD(ctx, kemCT)
-	})
 }
 
 func decryptPSKInternal(blob []byte, dk *mlkem.DecapsulationKey1024, aadFn func(kemCT []byte) []byte) ([PSKSize]byte, error) {

@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -356,7 +357,10 @@ func TestAuthenticatedProvisioning(t *testing.T) {
 	}
 
 	// 2. Client signs ephemeral ML-KEM key bound to context
-	sig := SignClientKey(clientPriv, mlkemPub, ctx)
+	sig, err := SignClientKey(clientPriv, mlkemPub, ctx)
+	if err != nil {
+		t.Fatalf("SignClientKey failed: %v", err)
+	}
 
 	// 3. Server verifies client signature before provisioning
 	if err := VerifyClientKey(clientPub, mlkemPub, ctx, sig); err != nil {
@@ -415,6 +419,214 @@ func TestAuthenticatedProvisioning(t *testing.T) {
 	badTimeCtx.Timestamp += 3600
 	if _, err := DecryptPSKWithContext(blob, dk, badTimeCtx); err == nil {
 		t.Error("expected error decrypting with modified Timestamp, got nil")
+	}
+}
+
+// TestProvisionContext_Validation tests structural, freshness, and nonce validation on ProvisionContext.
+func TestProvisionContext_Validation(t *testing.T) {
+	now := time.Now()
+	var validNonce [16]byte
+	_, _ = rand.Read(validNonce[:])
+
+	validCtx := ProvisionContext{
+		ClientID:     "client-1",
+		ServerID:     "server-1",
+		SessionNonce: validNonce,
+		Timestamp:    now.Unix(),
+	}
+
+	// 1. Valid context should pass
+	if err := validCtx.Validate(now, 5*time.Minute); err != nil {
+		t.Fatalf("valid context failed validation: %v", err)
+	}
+
+	// 2. Empty ClientID should fail
+	badClient := validCtx
+	badClient.ClientID = ""
+	if err := badClient.Validate(now, 5*time.Minute); !errors.Is(err, ErrEmptyIdentity) {
+		t.Errorf("expected ErrEmptyIdentity, got: %v", err)
+	}
+
+	// 3. Empty ServerID should fail
+	badServer := validCtx
+	badServer.ServerID = ""
+	if err := badServer.Validate(now, 5*time.Minute); !errors.Is(err, ErrEmptyIdentity) {
+		t.Errorf("expected ErrEmptyIdentity, got: %v", err)
+	}
+
+	// 4. Zero nonce should fail
+	badNonce := validCtx
+	badNonce.SessionNonce = [16]byte{}
+	if err := badNonce.Validate(now, 5*time.Minute); !errors.Is(err, ErrZeroNonce) {
+		t.Errorf("expected ErrZeroNonce, got: %v", err)
+	}
+
+	// 5. Expired timestamp (> maxSkew in past) should fail
+	stalePast := validCtx
+	stalePast.Timestamp = now.Add(-10 * time.Minute).Unix()
+	if err := stalePast.Validate(now, 5*time.Minute); !errors.Is(err, ErrStaleTimestamp) {
+		t.Errorf("expected ErrStaleTimestamp for past skew, got: %v", err)
+	}
+
+	// 6. Future timestamp (> maxSkew in future) should fail
+	staleFuture := validCtx
+	staleFuture.Timestamp = now.Add(10 * time.Minute).Unix()
+	if err := staleFuture.Validate(now, 5*time.Minute); !errors.Is(err, ErrStaleTimestamp) {
+		t.Errorf("expected ErrStaleTimestamp for future skew, got: %v", err)
+	}
+}
+
+// TestNonceCache_ReplayPrevention tests thread-safe session nonce replay detection and eviction.
+func TestNonceCache_ReplayPrevention(t *testing.T) {
+	nc := NewNonceCache()
+
+	var nonce [16]byte
+	_, _ = rand.Read(nonce[:])
+
+	expiry := time.Now().Add(10 * time.Minute)
+
+	// First presentation should succeed
+	if err := nc.CheckAndAdd(nonce, expiry); err != nil {
+		t.Fatalf("first presentation failed: %v", err)
+	}
+
+	// Immediate replay with same nonce should fail with ErrReplayDetected
+	if err := nc.CheckAndAdd(nonce, expiry); !errors.Is(err, ErrReplayDetected) {
+		t.Fatalf("expected ErrReplayDetected on replay, got: %v", err)
+	}
+
+	// Different nonce should succeed
+	var nonce2 [16]byte
+	_, _ = rand.Read(nonce2[:])
+	if err := nc.CheckAndAdd(nonce2, expiry); err != nil {
+		t.Fatalf("different nonce failed: %v", err)
+	}
+}
+
+// TestKeyLengthValidationInSignVerify ensures key length checks in SignClientKey & VerifyClientKey.
+func TestKeyLengthValidationInSignVerify(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := priv.Public().(ed25519.PublicKey)
+
+	var nonce [16]byte
+	_, _ = rand.Read(nonce[:])
+	ctx := ProvisionContext{
+		ClientID:     "client-1",
+		ServerID:     "server-1",
+		SessionNonce: nonce,
+		Timestamp:    time.Now().Unix(),
+	}
+
+	// 1. Wrong ML-KEM key size (e.g. 32-byte X25519 key or 1184-byte ML-KEM-768 key)
+	shortKey := make([]byte, 32)
+	if _, err := SignClientKey(priv, shortKey, ctx); !errors.Is(err, ErrInvalidPublicKeySize) {
+		t.Errorf("SignClientKey: expected ErrInvalidPublicKeySize, got %v", err)
+	}
+	if err := VerifyClientKey(pub, shortKey, ctx, make([]byte, 64)); !errors.Is(err, ErrInvalidPublicKeySize) {
+		t.Errorf("VerifyClientKey: expected ErrInvalidPublicKeySize, got %v", err)
+	}
+
+	// 2. Wrong Ed25519 public key size
+	validMLKEMKey := make([]byte, mlkem.EncapsulationKeySize1024)
+	if err := VerifyClientKey(make([]byte, 16), validMLKEMKey, ctx, make([]byte, 64)); err == nil {
+		t.Error("VerifyClientKey: expected error for invalid ed25519 public key size, got nil")
+	}
+
+	// 3. Wrong signature size
+	if err := VerifyClientKey(pub, validMLKEMKey, ctx, make([]byte, 32)); !errors.Is(err, ErrInvalidSignatureSize) {
+		t.Errorf("VerifyClientKey: expected ErrInvalidSignatureSize, got %v", err)
+	}
+}
+
+// TestUnifiedProvisioningFlow tests the end-to-end ProvisionPSK and ConsumeProvisionedPSK entry points.
+func TestUnifiedProvisioningFlow(t *testing.T) {
+	clientPub, clientPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dk, err := mlkem.GenerateKey1024()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mlkemPub := dk.EncapsulationKey().Bytes()
+
+	var sessionNonce [16]byte
+	_, _ = rand.Read(sessionNonce[:])
+
+	ctx := ProvisionContext{
+		ClientID:     "client-fra1-001",
+		ServerID:     "data-plane-fra1-1",
+		SessionNonce: sessionNonce,
+		Timestamp:    time.Now().Unix(),
+	}
+
+	sig, err := SignClientKey(clientPriv, mlkemPub, ctx)
+	if err != nil {
+		t.Fatalf("SignClientKey failed: %v", err)
+	}
+
+	// 1. Unified ProvisionPSK on server
+	serverPSK, blob, err := ProvisionPSK(clientPub, mlkemPub, sig, ctx)
+	if err != nil {
+		t.Fatalf("ProvisionPSK failed: %v", err)
+	}
+
+	// 2. Unified ConsumeProvisionedPSK on client
+	clientPSK, err := ConsumeProvisionedPSK(blob, dk, ctx)
+	if err != nil {
+		t.Fatalf("ConsumeProvisionedPSK failed: %v", err)
+	}
+
+	if serverPSK != clientPSK {
+		t.Fatal("consumed PSK does not match server PSK")
+	}
+
+	// 3. Security: ProvisionPSK rejects stale/expired context
+	staleCtx := ctx
+	staleCtx.Timestamp = time.Now().Add(-1 * time.Hour).Unix()
+	staleSig, _ := SignClientKey(clientPriv, mlkemPub, staleCtx)
+	if _, _, err := ProvisionPSK(clientPub, mlkemPub, staleSig, staleCtx); err == nil {
+		t.Error("ProvisionPSK should have failed with stale timestamp, got nil")
+	}
+
+	// 4. Security: ProvisionPSK rejects invalid client signature
+	badSig := make([]byte, len(sig))
+	copy(badSig, sig)
+	badSig[0] ^= 0xff
+	if _, _, err := ProvisionPSK(clientPub, mlkemPub, badSig, ctx); err == nil {
+		t.Error("ProvisionPSK should have failed with invalid signature, got nil")
+	}
+
+	// 5. Security: ConsumeProvisionedPSK rejects stale context
+	if _, err := ConsumeProvisionedPSK(blob, dk, staleCtx); err == nil {
+		t.Error("ConsumeProvisionedPSK should have failed with stale timestamp, got nil")
+	}
+}
+
+// TestDeprecatedNoContextAPI verifies that the deprecated/no-context APIs continue to function.
+func TestDeprecatedNoContextAPI(t *testing.T) {
+	dk, err := mlkem.GenerateKey1024()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := dk.EncapsulationKey().Bytes()
+
+	psk, blob, err := GenerateEncryptedPSKNoContext(pub)
+	if err != nil {
+		t.Fatalf("GenerateEncryptedPSKNoContext failed: %v", err)
+	}
+
+	recovered, err := DecryptPSKNoContext(blob, dk)
+	if err != nil {
+		t.Fatalf("DecryptPSKNoContext failed: %v", err)
+	}
+
+	if recovered != psk {
+		t.Fatal("recovered PSK mismatch in no-context API")
 	}
 }
 
