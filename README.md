@@ -1,7 +1,5 @@
 # Nimbuzz QuantVPN — Post-Quantum WireGuard Core
 
-[![Go Test](https://github.com/Nimbuzz-Developer/Nimbuzz-QuantVPN/actions/workflows/test.yml/badge.svg?branch=main)](crypto/crypto_test.go)
-[![Go Report Card](https://goreportcard.com/badge/github.com/Nimbuzz-Developer/Nimbuzz-QuantVPN)](https://goreportcard.com/report/github.com/Nimbuzz-Developer/Nimbuzz-QuantVPN)
 [![NIST FIPS 203](https://img.shields.io/badge/NIST-FIPS%20203%20ML--KEM--1024-blue.svg)](https://csrc.nist.gov/pubs/fips/203/final)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Jurisdiction: Nepal](https://img.shields.io/badge/Jurisdiction-Nepal%20(Outside%2014%20Eyes)-green.svg)](TRANSPARENCY.md)
