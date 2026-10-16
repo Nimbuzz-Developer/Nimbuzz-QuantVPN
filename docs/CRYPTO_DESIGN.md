@@ -22,9 +22,9 @@ Conventional VPN tunnels (including standard WireGuard and OpenVPN) rely exclusi
 
 ## 2. Standard WireGuard Protocol Baseline
 
-WireGuard establishes tunnels using the **Noise_IKpsk2** handshake pattern from the Noise Protocol Framework:
+WireGuard establishes tunnels using the **`Noise_IKpsk2`** handshake pattern from the Noise Protocol Framework:
 
-$$\text{Noise\_IKpsk2}: \leftarrow s \quad \dots \quad \rightarrow e, es, s, ss \quad \leftarrow e, ee, se, \mathbf{psk}$$
+$$\text{Noise}_{\text{IKpsk2}}: \leftarrow s \quad \dots \quad \rightarrow e, es, s, ss \quad \leftarrow e, ee, se, \mathbf{psk}$$
 
 ### 2.1 Classical Handshake Mechanics
 1. **Initiator (Client)** generates ephemeral keypair $(e_{\text{priv}}, e_{\text{pub}})$ and calculates ECDH shared secrets against the responder's static public key $(s_r)$.
@@ -43,7 +43,7 @@ $$\text{Noise\_IKpsk2}: \leftarrow s \quad \dots \quad \rightarrow e, es, s, ss 
 
 Standard WireGuard cannot directly encapsulate post-quantum ciphertexts (such as ML-KEM-1024's 1,568-byte ciphertext) inside its initial UDP handshake packet without exceeding Ethernet MTUs (1500 bytes), causing UDP packet fragmentation, IP-level packet loss, and amplification vulnerabilities.
 
-QuantVPN solves this with an **out-of-band Control Plane KEM encapsulation** that provisions a dynamic, post-quantum 256-bit PSK directly into the WireGuard kernel interface before the Noise_IKpsk2 handshake executes.
+QuantVPN solves this with an **out-of-band Control Plane KEM encapsulation** that provisions a dynamic, post-quantum 256-bit PSK directly into the WireGuard kernel interface before the `Noise_IKpsk2` handshake executes.
 
 ```
 +----------------------------------------------------------------------------------------------------+
@@ -191,7 +191,7 @@ All resulting session keys are quantum-secure.
 |:---|:---|:---|
 | **Asymmetric Key Exchange** | X25519 (ECDH over Curve25519) | Hybrid: X25519 + ML-KEM-1024 (FIPS 203) |
 | **Post-Quantum Security** | None (classical only, broken by Shor's algorithm) | NIST Security Level 5 (equivalent to AES-256) |
-| **PSK Mechanism** | Native `mixKey(psk)` slot in Noise_IKpsk2 | Dynamic ML-KEM out-of-band generation & injection |
+| **PSK Mechanism** | Native `mixKey(psk)` slot in `Noise_IKpsk2` | Dynamic ML-KEM out-of-band generation & injection |
 | **Encapsulation Transport** | None | Authenticated control-plane TLS envelope |
 | **Envelope Integrity** | N/A | ChaCha20-Poly1305 AEAD bound with AAD |
 | **Wire Protocol / UDP** | Standard UDP 51820 packets (148 bytes handshake) | 100% Unmodified WireGuard kernel wire packets |
