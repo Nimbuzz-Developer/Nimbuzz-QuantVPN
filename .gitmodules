@@ -1,0 +1,3 @@
+[submodule "wireguard-kernel"]
+	path = wireguard-kernel
+	url = https://github.com/WireGuard/wireguard-linux-compat.git

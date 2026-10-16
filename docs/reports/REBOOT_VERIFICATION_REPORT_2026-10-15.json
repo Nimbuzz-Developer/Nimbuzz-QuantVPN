@@ -1,0 +1,30 @@
+{
+  "report_id": "TEST-RAM-20261015-FRA1",
+  "date": "2026-10-15",
+  "server": "data-plane-fra1-1",
+  "region": "Frankfurt (fra1)",
+  "os": "Ubuntu 24.04 LTS (Linux 6.8.0-45-generic x86_64)",
+  "configuration": {
+    "overlayroot": "tmpfs",
+    "base_disk_mount": "/media/root-ro (ro)",
+    "swap": "disabled",
+    "journald_storage": "volatile"
+  },
+  "locations_checked": [
+    "/",
+    "/media/root-ro",
+    "/root/proof.txt",
+    "/var/log/proof.txt",
+    "/proc/swaps"
+  ],
+  "results": {
+    "pre_reboot_files_created": true,
+    "post_reboot_files_found": false,
+    "swap_active": false,
+    "status": "PASS"
+  },
+  "checksums_sha256": {
+    "setup_sh": "46d3229cd86b7c6d8ed479920f26fa78806ee80be8508f38c4ae13551774ddb3",
+    "verify_ram_disk_sh": "83588f0dec16f2f0969877b1eb3c0d4e24c834698e73f075f5e8e5a1876b68b2"
+  }
+}
