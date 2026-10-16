@@ -476,30 +476,60 @@ func TestProvisionContext_Validation(t *testing.T) {
 	}
 }
 
-// TestNonceCache_ReplayPrevention tests thread-safe session nonce replay detection and eviction.
+// TestNonceCache_ReplayPrevention tests thread-safe session nonce replay detection,
+// eviction, and rejection of invalid/past expiration times.
 func TestNonceCache_ReplayPrevention(t *testing.T) {
 	nc := NewNonceCache()
 
 	var nonce [16]byte
 	_, _ = rand.Read(nonce[:])
 
-	expiry := time.Now().Add(10 * time.Minute)
+	// 1. Edge-case regression: Reject already-expired expiry (past)
+	pastExpiry := time.Now().Add(-1 * time.Minute)
+	if err := nc.CheckAndAdd(nonce, pastExpiry); !errors.Is(err, ErrInvalidExpiry) {
+		t.Fatalf("expected ErrInvalidExpiry for past expiry, got: %v", err)
+	}
 
-	// First presentation should succeed
+	// 2. Edge-case regression: Reject now/zero expiry
+	if err := nc.CheckAndAdd(nonce, time.Now()); !errors.Is(err, ErrInvalidExpiry) {
+		t.Fatalf("expected ErrInvalidExpiry for current time, got: %v", err)
+	}
+
+	// 3. First presentation with valid future expiry succeeds
+	expiry := time.Now().Add(10 * time.Minute)
 	if err := nc.CheckAndAdd(nonce, expiry); err != nil {
 		t.Fatalf("first presentation failed: %v", err)
 	}
 
-	// Immediate replay with same nonce should fail with ErrReplayDetected
+	// 4. Immediate replay with same nonce fails with ErrReplayDetected
 	if err := nc.CheckAndAdd(nonce, expiry); !errors.Is(err, ErrReplayDetected) {
 		t.Fatalf("expected ErrReplayDetected on replay, got: %v", err)
 	}
 
-	// Different nonce should succeed
+	// 5. Different nonce succeeds
 	var nonce2 [16]byte
 	_, _ = rand.Read(nonce2[:])
 	if err := nc.CheckAndAdd(nonce2, expiry); err != nil {
 		t.Fatalf("different nonce failed: %v", err)
+	}
+
+	// 6. Test CheckAndAddContext with automatic expiry calculation
+	var nonce3 [16]byte
+	_, _ = rand.Read(nonce3[:])
+	ctx := ProvisionContext{
+		ClientID:     "client-test",
+		ServerID:     "server-test",
+		SessionNonce: nonce3,
+		Timestamp:    time.Now().Unix(),
+	}
+
+	if err := nc.CheckAndAddContext(ctx, DefaultMaxClockSkew); err != nil {
+		t.Fatalf("CheckAndAddContext failed: %v", err)
+	}
+
+	// Replaying context via CheckAndAddContext must detect replay
+	if err := nc.CheckAndAddContext(ctx, DefaultMaxClockSkew); !errors.Is(err, ErrReplayDetected) {
+		t.Fatalf("expected ErrReplayDetected on CheckAndAddContext replay, got: %v", err)
 	}
 }
 
@@ -575,7 +605,12 @@ func TestUnifiedProvisioningFlow(t *testing.T) {
 		t.Fatalf("ProvisionPSK failed: %v", err)
 	}
 
-	// 2. Unified ConsumeProvisionedPSK on client
+	// 2. Security: Immediate replay of same context to ProvisionPSK must fail with ErrReplayDetected
+	if _, _, err := ProvisionPSK(clientPub, mlkemPub, sig, ctx); !errors.Is(err, ErrReplayDetected) {
+		t.Fatalf("expected ErrReplayDetected on ProvisionPSK replay, got: %v", err)
+	}
+
+	// 3. Unified ConsumeProvisionedPSK on client
 	clientPSK, err := ConsumeProvisionedPSK(blob, dk, ctx)
 	if err != nil {
 		t.Fatalf("ConsumeProvisionedPSK failed: %v", err)
@@ -585,23 +620,35 @@ func TestUnifiedProvisioningFlow(t *testing.T) {
 		t.Fatal("consumed PSK does not match server PSK")
 	}
 
-	// 3. Security: ProvisionPSK rejects stale/expired context
+	// 4. Security: Immediate replay of same context to ConsumeProvisionedPSK must fail with ErrReplayDetected
+	if _, err := ConsumeProvisionedPSK(blob, dk, ctx); !errors.Is(err, ErrReplayDetected) {
+		t.Fatalf("expected ErrReplayDetected on ConsumeProvisionedPSK replay, got: %v", err)
+	}
+
+	// 5. Security: ProvisionPSK rejects stale/expired context
+	var staleNonce [16]byte
+	_, _ = rand.Read(staleNonce[:])
 	staleCtx := ctx
+	staleCtx.SessionNonce = staleNonce
 	staleCtx.Timestamp = time.Now().Add(-1 * time.Hour).Unix()
 	staleSig, _ := SignClientKey(clientPriv, mlkemPub, staleCtx)
 	if _, _, err := ProvisionPSK(clientPub, mlkemPub, staleSig, staleCtx); err == nil {
 		t.Error("ProvisionPSK should have failed with stale timestamp, got nil")
 	}
 
-	// 4. Security: ProvisionPSK rejects invalid client signature
+	// 6. Security: ProvisionPSK rejects invalid client signature (with fresh nonce)
+	var badSigNonce [16]byte
+	_, _ = rand.Read(badSigNonce[:])
+	badSigCtx := ctx
+	badSigCtx.SessionNonce = badSigNonce
 	badSig := make([]byte, len(sig))
 	copy(badSig, sig)
 	badSig[0] ^= 0xff
-	if _, _, err := ProvisionPSK(clientPub, mlkemPub, badSig, ctx); err == nil {
+	if _, _, err := ProvisionPSK(clientPub, mlkemPub, badSig, badSigCtx); err == nil {
 		t.Error("ProvisionPSK should have failed with invalid signature, got nil")
 	}
 
-	// 5. Security: ConsumeProvisionedPSK rejects stale context
+	// 7. Security: ConsumeProvisionedPSK rejects stale context
 	if _, err := ConsumeProvisionedPSK(blob, dk, staleCtx); err == nil {
 		t.Error("ConsumeProvisionedPSK should have failed with stale timestamp, got nil")
 	}

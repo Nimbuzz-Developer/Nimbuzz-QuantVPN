@@ -57,6 +57,7 @@ var (
 	ErrZeroNonce            = errors.New("crypto: session nonce must be non-zero")
 	ErrEmptyIdentity        = errors.New("crypto: client and server identity strings must not be empty")
 	ErrReplayDetected       = errors.New("crypto: session nonce replay detected")
+	ErrInvalidExpiry        = errors.New("crypto: nonce expiry must be strictly in the future")
 )
 
 // ProvisionContext binds a PSK exchange to specific client and server identities.
@@ -117,13 +118,19 @@ func NewNonceCache() *NonceCache {
 }
 
 // CheckAndAdd verifies that a session nonce has not been seen. If unseen, it records it
-// with an expiration time after which it is eligible for eviction. If already seen and not
-// expired, it returns ErrReplayDetected.
+// with an expiration time after which it is eligible for eviction.
+// If the supplied expiry is not strictly in the future (i.e. now or in the past), it rejects
+// the call with ErrInvalidExpiry to prevent miscalculated or stale expirations from subverting replay defense.
+// If already seen and not expired, it returns ErrReplayDetected.
 func (nc *NonceCache) CheckAndAdd(nonce [16]byte, expiry time.Time) error {
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
 
 	now := time.Now()
+	if !expiry.After(now) {
+		return ErrInvalidExpiry
+	}
+
 	// Lazy eviction of expired entries
 	for k, exp := range nc.entries {
 		if now.After(exp) {
@@ -137,6 +144,28 @@ func (nc *NonceCache) CheckAndAdd(nonce [16]byte, expiry time.Time) error {
 
 	nc.entries[nonce] = expiry
 	return nil
+}
+
+// CheckAndAddContext atomically validates context freshness and records its session nonce.
+// The expiry is calculated internally from the context timestamp and allowed skew window,
+// guaranteeing that the nonce is remembered as long as the timestamp remains fresh.
+// Callers do not need to calculate or supply expiry times manually.
+func (nc *NonceCache) CheckAndAddContext(ctx ProvisionContext, maxSkew time.Duration) error {
+	if maxSkew <= 0 {
+		maxSkew = DefaultMaxClockSkew
+	}
+	now := time.Now()
+	if err := ctx.Validate(now, maxSkew); err != nil {
+		return err
+	}
+
+	ctxTime := time.Unix(ctx.Timestamp, 0)
+	expiry := ctxTime.Add(maxSkew)
+	if !expiry.After(now) {
+		expiry = now.Add(maxSkew)
+	}
+
+	return nc.CheckAndAdd(ctx.SessionNonce, expiry)
 }
 
 // BuildAuthenticatedAAD creates additional authenticated data (AAD) for ChaCha20-Poly1305.
@@ -219,12 +248,36 @@ func VerifyClientKey(clientPubKey ed25519.PublicKey, mlkemPubKey []byte, ctx Pro
 	return nil
 }
 
+var (
+	defaultServerNonceCache = NewNonceCache()
+	defaultClientNonceCache = NewNonceCache()
+)
+
+// DefaultServerNonceCache returns the package-level server replay cache.
+func DefaultServerNonceCache() *NonceCache {
+	return defaultServerNonceCache
+}
+
+// DefaultClientNonceCache returns the package-level client replay cache.
+func DefaultClientNonceCache() *NonceCache {
+	return defaultClientNonceCache
+}
+
 // ProvisionPSK is the unified server-side entry point that authenticates the client's ML-KEM
-// public key, verifies context freshness/structure, and generates an encrypted PSK bound to the context.
-// Tying signature verification directly to encryption prevents separating or mis-pairing the keys or context.
-func ProvisionPSK(clientEdPub ed25519.PublicKey, clientMLKEMPub []byte, sig []byte, ctx ProvisionContext) ([PSKSize]byte, []byte, error) {
-	if err := ctx.Validate(time.Now(), DefaultMaxClockSkew); err != nil {
-		return [PSKSize]byte{}, nil, fmt.Errorf("validate context: %w", err)
+// public key, verifies context freshness/structure, enforces atomic nonce replay protection,
+// and generates an encrypted PSK bound to the context.
+//
+// An optional custom NonceCache can be provided (e.g. per-tenant or service instance).
+// If no cache is passed, the package-level defaultServerNonceCache is enforced automatically,
+// guaranteeing that replay protection is NEVER omitted.
+func ProvisionPSK(clientEdPub ed25519.PublicKey, clientMLKEMPub []byte, sig []byte, ctx ProvisionContext, cache ...*NonceCache) ([PSKSize]byte, []byte, error) {
+	nc := defaultServerNonceCache
+	if len(cache) > 0 && cache[0] != nil {
+		nc = cache[0]
+	}
+
+	if err := nc.CheckAndAddContext(ctx, DefaultMaxClockSkew); err != nil {
+		return [PSKSize]byte{}, nil, fmt.Errorf("nonce replay check: %w", err)
 	}
 	if err := VerifyClientKey(clientEdPub, clientMLKEMPub, ctx, sig); err != nil {
 		return [PSKSize]byte{}, nil, fmt.Errorf("verify client key: %w", err)
@@ -232,13 +285,31 @@ func ProvisionPSK(clientEdPub ed25519.PublicKey, clientMLKEMPub []byte, sig []by
 	return GenerateEncryptedPSKWithContext(clientMLKEMPub, ctx)
 }
 
-// ConsumeProvisionedPSK is the unified client-side entry point that validates context freshness
+// ProvisionPSKWithCache explicitly provisions a PSK with a dedicated caller-supplied NonceCache.
+func ProvisionPSKWithCache(cache *NonceCache, clientEdPub ed25519.PublicKey, clientMLKEMPub []byte, sig []byte, ctx ProvisionContext) ([PSKSize]byte, []byte, error) {
+	return ProvisionPSK(clientEdPub, clientMLKEMPub, sig, ctx, cache)
+}
+
+// ConsumeProvisionedPSK is the unified client-side entry point that validates context freshness,
+// enforces atomic nonce replay protection (preventing re-use of an encrypted PSK envelope),
 // and unwraps the encrypted PSK blob, verifying the AEAD tag against the session context.
-func ConsumeProvisionedPSK(blob []byte, dk *mlkem.DecapsulationKey1024, ctx ProvisionContext) ([PSKSize]byte, error) {
-	if err := ctx.Validate(time.Now(), DefaultMaxClockSkew); err != nil {
-		return [PSKSize]byte{}, fmt.Errorf("validate context: %w", err)
+//
+// An optional custom NonceCache can be provided. If not provided, defaultClientNonceCache is enforced.
+func ConsumeProvisionedPSK(blob []byte, dk *mlkem.DecapsulationKey1024, ctx ProvisionContext, cache ...*NonceCache) ([PSKSize]byte, error) {
+	nc := defaultClientNonceCache
+	if len(cache) > 0 && cache[0] != nil {
+		nc = cache[0]
+	}
+
+	if err := nc.CheckAndAddContext(ctx, DefaultMaxClockSkew); err != nil {
+		return [PSKSize]byte{}, fmt.Errorf("nonce replay check: %w", err)
 	}
 	return DecryptPSKWithContext(blob, dk, ctx)
+}
+
+// ConsumeProvisionedPSKWithCache explicitly unwraps a provisioned PSK with a dedicated caller-supplied NonceCache.
+func ConsumeProvisionedPSKWithCache(cache *NonceCache, blob []byte, dk *mlkem.DecapsulationKey1024, ctx ProvisionContext) ([PSKSize]byte, error) {
+	return ConsumeProvisionedPSK(blob, dk, ctx, cache)
 }
 
 // Zeroize wipes byte slices so sensitive data doesn't linger in memory.
