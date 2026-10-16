@@ -52,43 +52,50 @@ QuantVPN solves this with an **out-of-band Control Plane KEM encapsulation** tha
 
        CLIENT (iOS / macOS / Linux / Win)                             SERVER (RAM-Only Node)
   +-----------------------------------------+               +-----------------------------------------+
-  | 1. Generate ML-KEM-1024 Keypair         |               |                                         |
+  | 1. Long-term Ed25519 Identity Key       |               |                                         |
+  |    (client_priv, client_pub)            |               |                                         |
+  | 2. Generate ML-KEM-1024 Keypair         |               |                                         |
   |    (ek_client, dk_client)               |               |                                         |
-  | 2. Generate WireGuard X25519 Keypair    |               |                                         |
+  | 3. Establish Session Context & Sign     |               |                                         |
+  |    ctx = {ClientID, ServerID, Nonce, Ts}|               |                                         |
+  |    sig = Sign(client_priv, ek_client,ctx|               |                                         |
+  | 4. Generate WireGuard X25519 Keypair    |               |                                         |
   |    (wg_priv, wg_pub)                    |               |                                         |
   +--------------------+--------------------+               +--------------------+--------------------+
                        |                                                         |
                        |--- [HTTPS / TLS 1.3 Control Plane Session] ------------>|
                        |    POST /api/v1/peer/add                                |
-                       |    Body: { wg_pub, mlkem_pub: ek_client }               |
+                       |    Body: { wg_pub, mlkem_pub, ctx, client_pub, sig }    |
                        |                                                         |
                        |                                    +--------------------+--------------------+
-                       |                                    | 3. Generate Random 256-bit PSK          |
+                       |                                    | 5. Authenticate Client Signature:       |
+                       |                                    |    Verify(client_pub, mlkem_pub, ctx,sig|
+                       |                                    | 6. Generate Random 256-bit PSK          |
                        |                                    |    psk <- CPRNG(32 bytes)               |
-                       |                                    | 4. ML-KEM-1024 Encapsulation            |
+                       |                                    | 7. ML-KEM-1024 Encapsulation            |
                        |                                    |    (ss_kem, ct_kem) <- Encaps(ek_client)|
-                       |                                    | 5. HKDF-SHA256 Derivation               |
+                       |                                    | 8. HKDF-SHA256 Derivation               |
                        |                                    |    K_aead <- HKDF(ss_kem, label)        |
-                       |                                    | 6. ChaCha20-Poly1305 Seal               |
+                       |                                    | 9. ChaCha20-Poly1305 Seal with Context: |
+                       |                                    |    AAD = Version || ct_kem || ctx       |
                        |                                    |    C_psk <- Seal(K_aead, N, psk, AAD)   |
-                       |                                    | 7. Commit PSK to WireGuard Kernel:      |
-                       |                                    |    wg set wg0 peer <wg_pub>             |
-                       |                                    |           preshared-key <psk>           |
+                       |                                    | 10. Commit PSK into WireGuard Kernel    |
+                       |                                    |     (via UAPI socket, zeroizing memory) |
                        |                                    +--------------------+--------------------+
                        |                                                         |
                        |<-- Response: Encrypted PSK Blob (1629 bytes) -----------|
                        |    [Version | ct_kem | Nonce | C_psk]                   |
                        |                                                         |
   +--------------------+--------------------+                                    |
-  | 8. Verify Header & Version (0x01)       |                                    |
-  | 9. Decapsulate ML-KEM-1024:             |                                    |
-  |    ss_kem <- Decaps(dk_client, ct_kem)  |                                    |
-  | 10. Derive K_aead via HKDF-SHA256       |                                    |
-  | 11. ChaCha20-Poly1305 Open & Verify AAD |                                    |
+  | 11. Verify Header & Version (0x01)      |                                    |
+  | 12. Decapsulate ML-KEM-1024:            |                                    |
+  |     ss_kem <- Decaps(dk_client, ct_kem) |                                    |
+  | 13. Derive K_aead via HKDF-SHA256       |                                    |
+  | 14. ChaCha20-Poly1305 Open with Context |                                    |
+  |     AAD = Version || ct_kem || ctx      |                                    |
   |     psk <- Open(K_aead, N, C_psk, AAD)  |                                    |
-  | 12. Commit PSK to WireGuard:            |                                    |
-  |     wg set wg0 peer <server_pub>        |                                    |
-  |            preshared-key <psk>          |                                    |
+  | 15. Commit PSK into WireGuard Kernel    |                                    |
+  |     (zeroizing sensitive buffers)       |                                    |
   +--------------------+--------------------+                                    |
                        |                                                         |
                        |=========================================================|
@@ -105,40 +112,50 @@ QuantVPN solves this with an **out-of-band Control Plane KEM encapsulation** tha
 
 ## 4. Detailed Sequence of Cryptographic Operations
 
-### Step 1: Client Key Generation
+### Step 1: Client Key Generation & Identity Binding
 The client initializes its post-quantum and classical cryptographic contexts:
-1. Generates an ML-KEM-1024 decapsulation key $dk \in \{0,1\}^{3168}$ and encapsulation key $ek \in \{0,1\}^{1568}$ adhering to NIST FIPS 203.
-2. Generates a standard Curve25519 static private key $sk_{\text{wg}} \in \{0,1\}^{32}$ and computes public key $pk_{\text{wg}} = \text{X25519}(sk_{\text{wg}}, 9)$.
+1. Generates or loads its long-term Ed25519 client identity keypair (`client_priv`, `client_pub`).
+2. Generates an ephemeral ML-KEM-1024 decapsulation key $dk \in \{0,1\}^{3168}$ and encapsulation key $ek \in \{0,1\}^{1568}$ adhering to NIST FIPS 203.
+3. Generates a standard Curve25519 static private key $sk_{\text{wg}} \in \{0,1\}^{32}$ and computes public key $pk_{\text{wg}} = \text{X25519}(sk_{\text{wg}}, 9)$.
+4. Constructs a `ProvisionContext` containing `ClientID`, `ServerID`, `SessionNonce` (16 bytes CPRNG), and a Unix `Timestamp`.
+5. Signs the ephemeral ML-KEM public key and context using Ed25519 (`SignClientKey`), preventing man-in-the-middle key substitution.
 
 ### Step 2: Key Registration & Negotiation Request
-The client opens a TLS 1.3 control connection to the QuantVPN control plane and submits:
-- Client WireGuard Public Key: $pk_{\text{wg}}$ (32 bytes, base64 encoded)
-- Client ML-KEM-1024 Encapsulation Key: $ek$ (1568 bytes, base64 encoded)
+The client opens an authenticated TLS 1.3 control connection to the QuantVPN server and submits:
+- Client WireGuard Public Key: $pk_{\text{wg}}$ (32 bytes)
+- Client ML-KEM-1024 Encapsulation Key: $ek$ (1568 bytes)
+- Client Identity Public Key: `client_pub` (32 bytes)
+- Client Signature: `sig` (64 bytes)
+- Provisioning Context: `ctx` (`ClientID`, `ServerID`, `SessionNonce`, `Timestamp`)
 
-### Step 3: Server Encapsulation & Envelope Construction
-1. **Generate Symmetric PSK:**
+### Step 3: Server Signature Verification & KEM Encapsulation
+1. **Client Identity Authentication:**
+   The server verifies `sig` using `client_pub` over `ek` and `ctx`. If signature verification fails, the connection terminates immediately with `ErrClientAuthFailed`.
+2. **Generate Symmetric PSK:**
    $$\text{psk} \leftarrow_{\mathcal{R}} \{0,1\}^{256}$$
-2. **KEM Encapsulation:**
+3. **KEM Encapsulation:**
    $$(ss_{\text{kem}}, ct_{\text{kem}}) \leftarrow \text{ML-KEM-1024.Encaps}(ek)$$
    - Shared secret: $ss_{\text{kem}} \in \{0,1\}^{32}$ (256 bits)
    - KEM Ciphertext: $ct_{\text{kem}} \in \{0,1\}^{1568}$ (1568 bytes)
-3. **Key Derivation (HKDF-SHA256):**
+4. **Key Derivation (HKDF-SHA256):**
    $$K_{\text{aead}} = \text{HKDF-Expand}(\text{PRK}=\text{HKDF-Extract}(\text{salt}=\emptyset, ss_{\text{kem}}), \text{info}=\text{"wireguard-psk/encrypt/mlkem1024/v1"}, L=32)$$
-4. **Nonce Generation:**
+5. **Nonce Generation:**
    $$N \leftarrow_{\mathcal{R}} \{0,1\}^{96} \quad (12 \text{ bytes})$$
-5. **Authenticated Data (AAD) Construction:**
-   $$\text{AAD} = \text{Version} \, (0x01) \,\|\, ct_{\text{kem}} \quad (1569 \text{ bytes})$$
-6. **Authenticated Encryption (ChaCha20-Poly1305):**
+6. **Authenticated Data (AAD) Construction with Session Context:**
+   $$\text{AAD} = \text{Version} \, (0x01) \,\|\, ct_{\text{kem}} \,\|\, \text{len}(ClientID) \,\|\, ClientID \,\|\, \text{len}(ServerID) \,\|\, ServerID \,\|\, SessionNonce \,\|\, Timestamp$$
+   This cryptographically binds the envelope to this specific client, server, and session.
+7. **Authenticated Encryption (ChaCha20-Poly1305):**
    $$C_{\text{psk}} = \text{ChaCha20-Poly1305.Seal}(K_{\text{aead}}, N, \text{psk}, \text{AAD}) \quad (48 \text{ bytes})$$
    (32 bytes encrypted PSK + 16 bytes Poly1305 authentication tag).
-7. **Serialized Binary Envelope (1,629 bytes total):**
+8. **Serialized Binary Envelope (1,629 bytes total):**
    $$\text{Blob} = \underbrace{\text{Version}}_{1\text{ byte}} \,\|\, \underbrace{ct_{\text{kem}}}_{1568\text{ bytes}} \,\|\, \underbrace{N}_{12\text{ bytes}} \,\|\, \underbrace{C_{\text{psk}}}_{48\text{ bytes}}$$
 
 ### Step 4: Server Kernel State Commitment
-The control-plane applies the generated `psk` to the running WireGuard interface for peer $pk_{\text{wg}}$:
+The control-plane applies the generated `psk` directly into the running WireGuard interface for peer $pk_{\text{wg}}$ using the WireGuard UAPI or secure stream without printing keys in shell commands, terminal outputs, or process arguments:
 ```bash
-wg set wg0 peer <pk_wg> preshared-key <(echo -n "$psk")
+wg set wg0 peer <pk_wg> preshared-key /dev/stdin <<< "$psk"
 ```
+The server memory buffer containing `psk` is immediately scrubbed with `crypto.Zeroize`.
 
 ### Step 5: Client Decapsulation & Recovery
 Upon receiving the 1,629-byte blob:
@@ -147,16 +164,16 @@ Upon receiving the 1,629-byte blob:
    $$ss_{\text{kem}} = \text{ML-KEM-1024.Decaps}(dk, ct_{\text{kem}})$$
 3. **Derive Decryption Key:**
    $$K_{\text{aead}} = \text{HKDF-SHA256}(ss_{\text{kem}}, \text{"wireguard-psk/encrypt/mlkem1024/v1"}, 32)$$
-4. **AEAD Verification & Decryption:**
+4. **Context-Bound AEAD Verification & Decryption:**
    $$\text{psk} = \text{ChaCha20-Poly1305.Open}(K_{\text{aead}}, N, C_{\text{psk}}, \text{AAD})$$
-   If Poly1305 authentication verification fails, the operation immediately aborts with `ErrDecryptionFailed`. No unverified plaintext is released.
+   If any field of `ctx` was modified, or if the KEM ciphertext or encrypted PSK was altered, Poly1305 verification fails immediately and returns `ErrDecryptionFailed`. No unverified plaintext is released.
 
 ### Step 6: Client Kernel State Commitment
-The client configures its local tunnel interface:
+The client configures its local tunnel interface through the WireGuard API without exposing raw keys in terminal history:
 ```ini
 [Peer]
 PublicKey = <SERVER_PUBLIC_KEY>
-PresharedKey = <RECOVERED_PSK>
+PresharedKey = [REDACTED - 32 bytes provisioned via ML-KEM-1024 into kernel]
 Endpoint = <SERVER_IP>:51820
 AllowedIPs = 0.0.0.0/0, ::/0
 ```
@@ -206,7 +223,9 @@ All resulting session keys are quantum-secure.
 - **Key Size:** 32 bytes (256 bits).
 - **Nonce Size:** 12 bytes (96 bits) randomly generated per encapsulation.
 - **Tag Size:** 16 bytes (128 bits).
-- **AAD:** 1,569 bytes (Version byte $0x01$ concatenated with 1,568-byte KEM ciphertext).
+- **Associated Authenticated Data (AAD):**
+  - **Base Envelope:** 1,569 bytes (Version byte $0x01$ concatenated with 1,568-byte KEM ciphertext).
+  - **Context-Bound Provisioning (`BuildAuthenticatedAAD`):** Version byte ($0x01$) + KEM ciphertext ($1,568$ bytes) + length-prefixed `ClientID` + length-prefixed `ServerID` + 16-byte `SessionNonce` + 8-byte `Timestamp`.
 
 ---
 
@@ -215,14 +234,19 @@ All resulting session keys are quantum-secure.
 ### 7.1 IND-CCA2 Post-Quantum Hardness
 ML-KEM-1024 is an IND-CCA2 secure key encapsulation mechanism. Even if an adversary modifies bits in transit or queries the decapsulation oracle with chosen ciphertexts, the Fujisaki-Okamoto (FO) transform guarantees that decapsulation produces pseudorandom output without leaking private key coefficients.
 
-### 7.2 AEAD Envelope Binding & AAD Protection
-To prevent cross-protocol splicing, KEM ciphertext substitution, or format truncation attacks, the entire 1,568-byte KEM ciphertext and the 1-byte envelope version are authenticated as **Additional Authenticated Data (AAD)** in ChaCha20-Poly1305. If an attacker tampers with even a single bit of the KEM ciphertext or version header, the Poly1305 MAC verification fails immediately.
+### 7.2 Client Identity Authentication & Key Substitution Protection
+ML-KEM protects confidentiality for the intended private-key holder, but does not identify who created the public key. To prevent public key substitution (where an adversary substitutes their own ML-KEM key):
+1. The client signs the ephemeral ML-KEM public key and `ProvisionContext` with its long-term Ed25519 identity key (`SignClientKey`).
+2. The server verifies this signature (`VerifyClientKey`) before encapsulating the PSK.
+3. The server and client bind the session context into the ChaCha20-Poly1305 AAD (`BuildAuthenticatedAAD`).
+If any attacker tampers with the public key, the Ed25519 signature verification fails. If any attacker tampers with the server identity, client identity, or session nonce, ChaCha20-Poly1305 AEAD decryption fails (`ErrDecryptionFailed`).
 
 ### 7.3 Memory Hygiene & Zeroization
-All intermediate cryptographic secrets are scrubbed from RAM immediately after use:
+All intermediate cryptographic secrets and wire secrets are scrubbed from RAM immediately after use:
 - The ML-KEM shared secret `ss_kem` is zeroized using `defer Zeroize(sharedSecret)`.
 - The derived HKDF symmetric key `K_aead` is zeroized using `defer Zeroize(key)`.
-- Ephemeral plaintext buffers are cleared prior to returning.
+- The WireGuard pre-shared key buffers (`psk` and `recoveredPSK`) are explicitly zeroized using `defer Zeroize(psk[:])`.
+- Live plaintext PSKs are never emitted to stdout, CLI logs, or process argument lists. Truncated SHA-256 fingerprints are used solely for diagnostic status verification.
 
 ---
 

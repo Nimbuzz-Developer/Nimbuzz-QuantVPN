@@ -3,10 +3,12 @@
 package crypto
 
 import (
+	"crypto/ed25519"
 	"crypto/hkdf"
 	"crypto/mlkem"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -44,7 +46,85 @@ var (
 	ErrDecryptionFailed     = errors.New("crypto: decryption failed: wrong key or corrupted blob")
 	ErrInvalidDecryptedSize = errors.New("crypto: invalid decrypted PSK length")
 	ErrInvalidPublicKeySize = errors.New("crypto: invalid ML-KEM-1024 public key size")
+	ErrClientAuthFailed     = errors.New("crypto: client identity signature verification failed")
+	ErrInvalidSignatureSize = errors.New("crypto: invalid signature size")
 )
+
+// ProvisionContext binds a PSK exchange to specific identities and a fresh session.
+// This prevents man-in-the-middle key substitution, replays, and session mixups.
+type ProvisionContext struct {
+	ClientID     string   // Unique client identity (e.g. client ID or pubkey fingerprint)
+	ServerID     string   // Designated server identity (e.g. "data-plane-fra1-1")
+	SessionNonce [16]byte // Freshness nonce to guarantee per-session uniqueness
+	Timestamp    int64    // Unix timestamp (seconds) for freshness validation
+}
+
+// BuildAuthenticatedAAD creates additional authenticated data (AAD) for ChaCha20-Poly1305.
+// It cryptographically binds the format version, ML-KEM ciphertext, client ID, server ID,
+// session nonce, and timestamp to the envelope authentication tag.
+func BuildAuthenticatedAAD(ctx ProvisionContext, kemCT []byte) []byte {
+	aad := make([]byte, 0, 1+len(kemCT)+2+len(ctx.ClientID)+2+len(ctx.ServerID)+16+8)
+	aad = append(aad, FormatVersion)
+	aad = append(aad, kemCT...)
+
+	var buf [8]byte
+	binary.BigEndian.PutUint16(buf[:2], uint16(len(ctx.ClientID)))
+	aad = append(aad, buf[:2]...)
+	aad = append(aad, ctx.ClientID...)
+
+	binary.BigEndian.PutUint16(buf[:2], uint16(len(ctx.ServerID)))
+	aad = append(aad, buf[:2]...)
+	aad = append(aad, ctx.ServerID...)
+
+	aad = append(aad, ctx.SessionNonce[:]...)
+
+	binary.BigEndian.PutUint64(buf[:8], uint64(ctx.Timestamp))
+	aad = append(aad, buf[:8]...)
+
+	return aad
+}
+
+// ClientSignaturePayload constructs the digest signed by the client's long-term identity key.
+// It authenticates ownership of the ephemeral ML-KEM public key within the session context.
+func ClientSignaturePayload(mlkemPubKey []byte, ctx ProvisionContext) []byte {
+	h := sha256.New()
+	h.Write([]byte("quantvpn-client-auth-v1\n"))
+	h.Write(mlkemPubKey)
+
+	var buf [8]byte
+	binary.BigEndian.PutUint16(buf[:2], uint16(len(ctx.ClientID)))
+	h.Write(buf[:2])
+	h.Write([]byte(ctx.ClientID))
+
+	binary.BigEndian.PutUint16(buf[:2], uint16(len(ctx.ServerID)))
+	h.Write(buf[:2])
+	h.Write([]byte(ctx.ServerID))
+
+	h.Write(ctx.SessionNonce[:])
+
+	binary.BigEndian.PutUint64(buf[:8], uint64(ctx.Timestamp))
+	h.Write(buf[:8])
+
+	return h.Sum(nil)
+}
+
+// SignClientKey signs the client's ML-KEM public key and session context using an Ed25519 identity key.
+func SignClientKey(priv ed25519.PrivateKey, mlkemPubKey []byte, ctx ProvisionContext) []byte {
+	payload := ClientSignaturePayload(mlkemPubKey, ctx)
+	return ed25519.Sign(priv, payload)
+}
+
+// VerifyClientKey validates that the ML-KEM public key was signed by clientPubKey for this context.
+func VerifyClientKey(clientPubKey ed25519.PublicKey, mlkemPubKey []byte, ctx ProvisionContext, sig []byte) error {
+	if len(sig) != ed25519.SignatureSize {
+		return ErrInvalidSignatureSize
+	}
+	payload := ClientSignaturePayload(mlkemPubKey, ctx)
+	if !ed25519.Verify(clientPubKey, payload, sig) {
+		return ErrClientAuthFailed
+	}
+	return nil
+}
 
 // Zeroize wipes byte slices so sensitive data doesn't linger in memory.
 func Zeroize(b []byte) {
@@ -70,9 +150,43 @@ func GenerateEncryptedPSK(recipientPubKey []byte) ([PSKSize]byte, []byte, error)
 	return psk, encrypted, nil
 }
 
+// GenerateEncryptedPSKWithContext generates a random 32-byte WireGuard PSK and encrypts it
+// to the recipient's ML-KEM public key, binding the session context to the AEAD tag.
+func GenerateEncryptedPSKWithContext(recipientPubKey []byte, ctx ProvisionContext) ([PSKSize]byte, []byte, error) {
+	psk, err := GeneratePSK()
+	if err != nil {
+		return psk, nil, fmt.Errorf("generate psk: %w", err)
+	}
+
+	encrypted, err := EncryptPSKWithContext(psk, recipientPubKey, ctx)
+	if err != nil {
+		Zeroize(psk[:])
+		return [PSKSize]byte{}, nil, fmt.Errorf("encrypt psk: %w", err)
+	}
+
+	return psk, encrypted, nil
+}
+
 // EncryptPSK encrypts an existing 32-byte WireGuard PSK to the recipient's ML-KEM-1024 public key.
 // It encapsulates a shared secret, derives a symmetric key using HKDF-SHA256, and seals the PSK with ChaCha20-Poly1305.
 func EncryptPSK(psk [PSKSize]byte, recipientPubKey []byte) ([]byte, error) {
+	return encryptPSKInternal(psk, recipientPubKey, func(kemCT []byte) []byte {
+		aad := make([]byte, 1+len(kemCT))
+		aad[0] = FormatVersion
+		copy(aad[1:], kemCT)
+		return aad
+	})
+}
+
+// EncryptPSKWithContext encrypts an existing 32-byte WireGuard PSK to the recipient's ML-KEM-1024 public key,
+// cryptographically binding the session context into the ChaCha20-Poly1305 AEAD tag.
+func EncryptPSKWithContext(psk [PSKSize]byte, recipientPubKey []byte, ctx ProvisionContext) ([]byte, error) {
+	return encryptPSKInternal(psk, recipientPubKey, func(kemCT []byte) []byte {
+		return BuildAuthenticatedAAD(ctx, kemCT)
+	})
+}
+
+func encryptPSKInternal(psk [PSKSize]byte, recipientPubKey []byte, aadFn func(kemCT []byte) []byte) ([]byte, error) {
 	if len(recipientPubKey) != mlkem.EncapsulationKeySize1024 {
 		return nil, fmt.Errorf("%w: want %d bytes, got %d",
 			ErrInvalidPublicKeySize,
@@ -111,9 +225,7 @@ func EncryptPSK(psk [PSKSize]byte, recipientPubKey []byte) ([]byte, error) {
 	out = append(out, FormatVersion)
 	out = append(out, kemCT...)
 
-	// Bind the version byte and KEM ciphertext into the AEAD authenticated data.
-	aad := out[:1+KEMCiphertextSize]
-
+	aad := aadFn(kemCT)
 	ciphertext := aead.Seal(nil, nonce, psk[:], aad)
 
 	out = append(out, nonce...)
@@ -124,6 +236,22 @@ func EncryptPSK(psk [PSKSize]byte, recipientPubKey []byte) ([]byte, error) {
 
 // DecryptPSK unwraps an encrypted PSK blob using the recipient's ML-KEM-1024 private key.
 func DecryptPSK(blob []byte, dk *mlkem.DecapsulationKey1024) ([PSKSize]byte, error) {
+	return decryptPSKInternal(blob, dk, func(kemCT []byte) []byte {
+		aad := make([]byte, 1+len(kemCT))
+		aad[0] = FormatVersion
+		copy(aad[1:], kemCT)
+		return aad
+	})
+}
+
+// DecryptPSKWithContext unwraps an encrypted PSK blob and validates the session context in the AEAD tag.
+func DecryptPSKWithContext(blob []byte, dk *mlkem.DecapsulationKey1024, ctx ProvisionContext) ([PSKSize]byte, error) {
+	return decryptPSKInternal(blob, dk, func(kemCT []byte) []byte {
+		return BuildAuthenticatedAAD(ctx, kemCT)
+	})
+}
+
+func decryptPSKInternal(blob []byte, dk *mlkem.DecapsulationKey1024, aadFn func(kemCT []byte) []byte) ([PSKSize]byte, error) {
 	var psk [PSKSize]byte
 
 	if len(blob) != EncryptedPSKSize {
@@ -157,7 +285,7 @@ func DecryptPSK(blob []byte, dk *mlkem.DecapsulationKey1024) ([PSKSize]byte, err
 		return psk, fmt.Errorf("create aead: %w", err)
 	}
 
-	aad := blob[:1+KEMCiphertextSize]
+	aad := aadFn(kemCT)
 	plain, err := aead.Open(nil, nonce, sealed, aad)
 	if err != nil {
 		return psk, ErrDecryptionFailed

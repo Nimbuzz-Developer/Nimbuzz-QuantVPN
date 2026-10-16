@@ -19,8 +19,11 @@ The automated test suite (`crypto/crypto_test.go`) covers cryptographic correctn
 | `TestTamperedVersion` | Modification of format version byte (0x02, 0xFF) | Format version negotiation & isolation |
 | `TestMalformedBlobSizes` | Envelopes of sizes {0, 1, 16, 500, 1568, 1628, 1630, 2048, 65536} bytes | Size validation and truncation checks |
 | `TestInvalidPublicKey` | Public keys of 32 bytes (X25519), 1184 bytes (ML-KEM-768), and nil | Input type and length validation |
-| `TestKnownAnswerTest_HKDF` | Deterministic HKDF-SHA256 test with fixed vector and label | Key derivation test vector check |
-| `TestKnownAnswerTest_ChaCha20Poly1305` | Deterministic AEAD seal/open with fixed key, nonce, and AAD | AEAD test vector check |
+| `TestKnownAnswerTest_HKDF` | Fixed test vector compared against independently computed hex constant | HKDF-SHA256 deterministic derivation KAT |
+| `TestRFC5869_HKDF_KAT` | Official RFC 5869 Section A.1 Test Case 1 KAT with literal OKM hex | RFC 5869 reference compliance |
+| `TestRFC8439_ChaCha20Poly1305_KAT` | Official RFC 8439 Section 2.8.2 KAT with literal ciphertext & tag | RFC 8439 reference compliance |
+| `TestChaCha20Poly1305_RoundTrip` | Deterministic AEAD seal/open round-trip check | AEAD seal/open correctness |
+| `TestAuthenticatedProvisioning` | End-to-end client identity authentication, signing, and contextual AAD tamper detection | MitM key substitution & session tampering protection |
 | `TestZeroization` | Scrubbing sensitive memory buffers with `Zeroize()` | Sensitive buffer cleanup in RAM |
 | `TestConcurrency` | 20 parallel worker goroutines running 50 iterations each | Thread safety under concurrent load |
 | `BenchmarkGenerateEncryptedPSK` | Throughput of server-side PSK encapsulation | Server encapsulation throughput |
@@ -60,16 +63,21 @@ go test -v ./...
 === RUN   TestInvalidPublicKey
 --- PASS: TestInvalidPublicKey (0.00s)
 === RUN   TestKnownAnswerTest_HKDF
-    crypto_test.go:222: KAT HKDF Derived Key Vector: a4f213d02594319d72173c58fce12bb7ce0204a48f3f0a476ca42bd624289133
 --- PASS: TestKnownAnswerTest_HKDF (0.00s)
-=== RUN   TestKnownAnswerTest_ChaCha20Poly1305
---- PASS: TestKnownAnswerTest_ChaCha20Poly1305 (0.00s)
+=== RUN   TestRFC5869_HKDF_KAT
+--- PASS: TestRFC5869_HKDF_KAT (0.00s)
+=== RUN   TestRFC8439_ChaCha20Poly1305_KAT
+--- PASS: TestRFC8439_ChaCha20Poly1305_KAT (0.00s)
+=== RUN   TestChaCha20Poly1305_RoundTrip
+--- PASS: TestChaCha20Poly1305_RoundTrip (0.00s)
+=== RUN   TestAuthenticatedProvisioning
+--- PASS: TestAuthenticatedProvisioning (0.00s)
 === RUN   TestZeroization
 --- PASS: TestZeroization (0.00s)
 === RUN   TestConcurrency
 --- PASS: TestConcurrency (0.03s)
 PASS
-ok      nimbuzz.com/mlkem-psk/crypto    0.646s
+ok      nimbuzz.com/mlkem-psk/crypto    0.496s
 ```
 
 ### 2.3 Running Concurrency & Race Detector

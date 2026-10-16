@@ -2,11 +2,15 @@ package crypto
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/hkdf"
 	"crypto/mlkem"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -190,10 +194,11 @@ func TestInvalidPublicKey(t *testing.T) {
 	}
 }
 
-// TestKnownAnswerTest_HKDF verifies deterministic key derivation with a fixed test vector.
+// TestKnownAnswerTest_HKDF verifies key derivation against an independently computed literal vector.
 func TestKnownAnswerTest_HKDF(t *testing.T) {
-	// Fixed 32-byte test input
+	// Fixed 32-byte test input (0x42 repeated)
 	testSharedSecret := bytes.Repeat([]byte{0x42}, 32)
+	const expectedHex = "a4f213d02594319d72173c58fce12bb7ce0204a48f3f0a476ca42bd624289133"
 
 	key1, err := DeriveKey(testSharedSecret)
 	if err != nil {
@@ -204,22 +209,100 @@ func TestKnownAnswerTest_HKDF(t *testing.T) {
 		t.Fatalf("expected 32-byte key, got %d", len(key1))
 	}
 
-	// Must produce identical key on second run
+	actualHex := hex.EncodeToString(key1)
+	if actualHex != expectedHex {
+		t.Fatalf("HKDF KAT mismatch: got %s, want %s", actualHex, expectedHex)
+	}
+
+	// Must also produce identical key deterministically on repeated calls
 	key2, err := DeriveKey(testSharedSecret)
 	if err != nil {
 		t.Fatalf("DeriveKey second run failed: %v", err)
 	}
-
 	if !bytes.Equal(key1, key2) {
 		t.Fatalf("HKDF is not deterministic: %x != %x", key1, key2)
 	}
-
-	expectedHex := hex.EncodeToString(key1)
-	t.Logf("KAT HKDF Derived Key Vector: %s", expectedHex)
 }
 
-// TestKnownAnswerTest_ChaCha20Poly1305 verifies AEAD seal and open with fixed test inputs.
-func TestKnownAnswerTest_ChaCha20Poly1305(t *testing.T) {
+// TestRFC5869_HKDF_KAT tests the underlying HKDF-SHA256 primitive using RFC 5869 Test Case 1.
+func TestRFC5869_HKDF_KAT(t *testing.T) {
+	// RFC 5869 Section A.1 Test Case 1:
+	// IKM  = 0x0b repeated 22 times
+	// Salt = 0x000102030405060708090a0b0c (13 bytes)
+	// Info = 0xf0f1f2f3f4f5f6f7f8f9 (10 bytes)
+	// L    = 42 bytes
+	ikm := bytes.Repeat([]byte{0x0b}, 22)
+	salt, err := hex.DecodeString("000102030405060708090a0b0c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := hex.DecodeString("f0f1f2f3f4f5f6f7f8f9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const expectedOKMHex = "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+
+	okm, err := hkdf.Key(sha256.New, ikm, salt, string(info), 42)
+	if err != nil {
+		t.Fatalf("hkdf.Key failed: %v", err)
+	}
+
+	actualHex := hex.EncodeToString(okm)
+	if actualHex != expectedOKMHex {
+		t.Fatalf("RFC 5869 Test Case 1 KAT failed:\ngot:  %s\nwant: %s", actualHex, expectedOKMHex)
+	}
+}
+
+// TestRFC8439_ChaCha20Poly1305_KAT verifies ChaCha20-Poly1305 against official RFC 8439 Section 2.8.2 test vector.
+func TestRFC8439_ChaCha20Poly1305_KAT(t *testing.T) {
+	// RFC 8439 Section 2.8.2 Test Vector
+	keyHex := "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+	nonceHex := "070000004041424344454647"
+	aadHex := "50515253c0c1c2c3c4c5c6c7"
+	plaintext := []byte("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.")
+	expectedSealedHex := "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691"
+
+	key, err := hex.DecodeString(keyHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce, err := hex.DecodeString(nonceHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aad, err := hex.DecodeString(aadHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		t.Fatalf("chacha20poly1305.New failed: %v", err)
+	}
+
+	// 1. Verify Seal produces the RFC KAT ciphertext + tag
+	sealed := aead.Seal(nil, nonce, plaintext, aad)
+	actualSealedHex := hex.EncodeToString(sealed)
+	if actualSealedHex != expectedSealedHex {
+		t.Fatalf("RFC 8439 Seal KAT mismatch:\ngot:  %s\nwant: %s", actualSealedHex, expectedSealedHex)
+	}
+
+	// 2. Verify Open authenticates and recovers the plaintext from the RFC KAT vector
+	expectedSealedBytes, err := hex.DecodeString(expectedSealedHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decrypted, err := aead.Open(nil, nonce, expectedSealedBytes, aad)
+	if err != nil {
+		t.Fatalf("RFC 8439 Open KAT failed: %v", err)
+	}
+	if !bytes.Equal(decrypted, plaintext) {
+		t.Fatalf("RFC 8439 decrypted plaintext mismatch:\ngot:  %s\nwant: %s", string(decrypted), string(plaintext))
+	}
+}
+
+// TestChaCha20Poly1305_RoundTrip verifies AEAD seal and open with arbitrary test inputs.
+func TestChaCha20Poly1305_RoundTrip(t *testing.T) {
 	key := bytes.Repeat([]byte{0x01}, 32)
 	nonce := bytes.Repeat([]byte{0x02}, NonceSize)
 	aad := []byte("quantvpn-kat-aad-v1")
@@ -243,6 +326,95 @@ func TestKnownAnswerTest_ChaCha20Poly1305(t *testing.T) {
 
 	if !bytes.Equal(recovered, psk[:]) {
 		t.Fatalf("recovered bytes do not match original psk: %x != %x", recovered, psk)
+	}
+}
+
+// TestAuthenticatedProvisioning tests the authenticated key provisioning protocol.
+func TestAuthenticatedProvisioning(t *testing.T) {
+	// 1. Client creates long-term Ed25519 identity and ephemeral ML-KEM-1024 keypair
+	clientPub, clientPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519 key: %v", err)
+	}
+
+	dk, err := mlkem.GenerateKey1024()
+	if err != nil {
+		t.Fatalf("generate mlkem key: %v", err)
+	}
+	mlkemPub := dk.EncapsulationKey().Bytes()
+
+	var sessionNonce [16]byte
+	if _, err := rand.Read(sessionNonce[:]); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := ProvisionContext{
+		ClientID:     "client-fra1-001",
+		ServerID:     "data-plane-fra1-1",
+		SessionNonce: sessionNonce,
+		Timestamp:    time.Now().Unix(),
+	}
+
+	// 2. Client signs ephemeral ML-KEM key bound to context
+	sig := SignClientKey(clientPriv, mlkemPub, ctx)
+
+	// 3. Server verifies client signature before provisioning
+	if err := VerifyClientKey(clientPub, mlkemPub, ctx, sig); err != nil {
+		t.Fatalf("valid signature failed verification: %v", err)
+	}
+
+	// 4. Server generates encrypted PSK bound to context
+	serverPSK, blob, err := GenerateEncryptedPSKWithContext(mlkemPub, ctx)
+	if err != nil {
+		t.Fatalf("GenerateEncryptedPSKWithContext failed: %v", err)
+	}
+
+	// 5. Client decrypts and verifies context binding
+	recoveredPSK, err := DecryptPSKWithContext(blob, dk, ctx)
+	if err != nil {
+		t.Fatalf("DecryptPSKWithContext failed: %v", err)
+	}
+	if recoveredPSK != serverPSK {
+		t.Fatal("recovered PSK does not match server PSK")
+	}
+
+	// 6. Security tests: Tampering resistance
+
+	// 6a. Tampered ML-KEM public key fails signature verification
+	tamperedPubKey := make([]byte, len(mlkemPub))
+	copy(tamperedPubKey, mlkemPub)
+	tamperedPubKey[10] ^= 0xff
+	if err := VerifyClientKey(clientPub, tamperedPubKey, ctx, sig); err == nil {
+		t.Error("expected error for tampered public key, got nil")
+	}
+
+	// 6b. Tampered signature fails verification
+	tamperedSig := make([]byte, len(sig))
+	copy(tamperedSig, sig)
+	tamperedSig[0] ^= 0xff
+	if err := VerifyClientKey(clientPub, mlkemPub, ctx, tamperedSig); err == nil {
+		t.Error("expected error for tampered signature, got nil")
+	}
+
+	// 6c. Context mismatch: Client decrypts with tampered ServerID -> AEAD tag verification fails
+	badServerCtx := ctx
+	badServerCtx.ServerID = "rogue-server-001"
+	if _, err := DecryptPSKWithContext(blob, dk, badServerCtx); err == nil {
+		t.Error("expected error decrypting with swapped ServerID, got nil")
+	}
+
+	// 6d. Context mismatch: Tampered SessionNonce -> AEAD tag verification fails
+	badNonceCtx := ctx
+	badNonceCtx.SessionNonce[0] ^= 0xaa
+	if _, err := DecryptPSKWithContext(blob, dk, badNonceCtx); err == nil {
+		t.Error("expected error decrypting with tampered SessionNonce, got nil")
+	}
+
+	// 6e. Context mismatch: Old/swapped Timestamp -> AEAD tag verification fails
+	badTimeCtx := ctx
+	badTimeCtx.Timestamp += 3600
+	if _, err := DecryptPSKWithContext(blob, dk, badTimeCtx); err == nil {
+		t.Error("expected error decrypting with modified Timestamp, got nil")
 	}
 }
 

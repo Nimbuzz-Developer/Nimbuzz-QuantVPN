@@ -52,7 +52,7 @@ QuantVPN adds **NIST FIPS 203 ML-KEM-1024** (formerly Kyber-1024) to WireGuard. 
                                           |
                       +-------------------v-------------------+
                       |   ChaCha20-Poly1305 AEAD Seal         |
-                      |   Payload: PSK | AAD: Version+CT      |
+                      |   Payload: PSK | AAD: Version+CT+Ctx  |
                       +-------------------+-------------------+
                                           |
                       +-------------------v-------------------+
@@ -66,7 +66,7 @@ QuantVPN adds **NIST FIPS 203 ML-KEM-1024** (formerly Kyber-1024) to WireGuard. 
 - **Hybrid security:** WireGuard's native X25519 key exchange still runs. An attacker would have to break both X25519 and ML-KEM-1024 to read traffic.
 - **Standard WireGuard packets:** Post-quantum keys and ciphertexts (1,568 bytes) are too large to fit in WireGuard's initial UDP handshake packet without packet fragmentation. Exchanging the key out-of-band and injecting it as a PSK keeps WireGuard's standard UDP wire format, 1420 MTU, and kernel performance untouched.
 - **Pure Go:** Uses Go's standard library `crypto/mlkem` package (standardized in NIST FIPS 203) and `golang.org/x/crypto/chacha20poly1305`. No C wrappers or foreign dependencies.
-- **Authenticated envelope:** The 1,629-byte blob binds the version byte and KEM ciphertext into ChaCha20-Poly1305 as Additional Authenticated Data (AAD), so any tampering fails before decryption.
+- **Authenticated envelope & identity binding:** The client signs its ephemeral ML-KEM public key with its long-term Ed25519 identity key. The 1,629-byte envelope binds the client ID, server ID, session nonce, version, and KEM ciphertext into ChaCha20-Poly1305 as Additional Authenticated Data (AAD), preventing key substitution and replay attacks before decryption.
 
 ---
 
