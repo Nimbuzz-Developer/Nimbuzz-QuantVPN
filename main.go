@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"os"
@@ -23,7 +24,19 @@ func main() {
 
 	start := time.Now()
 
-	// 1. Client creates long-term Ed25519 identity and ephemeral ML-KEM-1024 keypair
+	// 0. Classical Layer: Generate native WireGuard X25519 keypairs for Client and Server
+	clientWGPriv, clientWGPub, err := crypto.GenerateWireGuardKeypair()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to generate client wireguard key: %v\n", err)
+		os.Exit(1)
+	}
+	serverWGPriv, serverWGPub, err := crypto.GenerateWireGuardKeypair()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to generate server wireguard key: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 1. Post-Quantum Layer: Client creates Ed25519 identity and ephemeral ML-KEM-1024 keypair
 	t0 := time.Now()
 	clientPub, clientPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -102,9 +115,51 @@ func main() {
 
 	fmt.Printf("\nSuccess: Authenticated key exchange complete (total: %v)\n", time.Since(start))
 	fmt.Printf("Key fingerprint matches: %x...\n", clientFP[:8])
-	fmt.Println("\nWireGuard configuration:")
-	fmt.Println("[Peer]")
-	fmt.Println("PresharedKey = [REDACTED - 32 bytes provisioned via ML-KEM-1024 into kernel]")
+
+	pskB64 := base64.StdEncoding.EncodeToString(recoveredPSK[:])
+
+	// 5. Native WireGuard X25519 + ML-KEM Hybrid Demonstration
+	fmt.Println("\n=========================================================")
+	fmt.Println("WireGuard Native Hybrid Integration Demonstration")
+	fmt.Println("=========================================================")
+	fmt.Println("WireGuard handles classical X25519 ECDH in the OS kernel.")
+	fmt.Println("QuantVPN provisions the post-quantum ML-KEM PSK out-of-band.")
+	fmt.Println("The kernel mixes both primitives via BLAKE2s in Noise_IKpsk2.")
+
+	fmt.Println("\n--- [Client] WireGuard Interface Configuration (wg0-client.conf) ---")
+	fmt.Printf("[Interface]\n")
+	fmt.Printf("# Layer 1: Classical Native X25519 Private Key\n")
+	fmt.Printf("PrivateKey = %s\n", clientWGPriv)
+	fmt.Printf("Address = 10.0.0.2/32\n\n")
+	fmt.Printf("[Peer]\n")
+	fmt.Printf("# Layer 1: Classical Native X25519 Server Public Key\n")
+	fmt.Printf("PublicKey = %s\n", serverWGPub)
+	fmt.Printf("# Layer 2: Post-Quantum WireGuard PSK (derived via ML-KEM-1024)\n")
+	fmt.Printf("PresharedKey = %s\n", pskB64)
+	fmt.Printf("Endpoint = 198.51.100.1:51820\n")
+	fmt.Printf("AllowedIPs = 0.0.0.0/0\n")
+
+	fmt.Println("\n--- [Server] WireGuard Peer Configuration (wg0-server.conf) ---")
+	fmt.Printf("[Interface]\n")
+	fmt.Printf("# Layer 1: Classical Native X25519 Server Private Key\n")
+	fmt.Printf("PrivateKey = %s\n", serverWGPriv)
+	fmt.Printf("ListenPort = 51820\n\n")
+	fmt.Printf("[Peer]\n")
+	fmt.Printf("# Layer 1: Classical Native X25519 Client Public Key\n")
+	fmt.Printf("PublicKey = %s\n", clientWGPub)
+	fmt.Printf("# Layer 2: Post-Quantum WireGuard PSK (derived via ML-KEM-1024)\n")
+	fmt.Printf("PresharedKey = %s\n", pskB64)
+	fmt.Printf("AllowedIPs = 10.0.0.2/32\n")
+
+	fmt.Println("\n--- Dynamic Kernel UAPI Injection (Zero-Downtime Live Update) ---")
+	fmt.Println("The control-plane applies the hybrid PSK directly into the running kernel:")
+	fmt.Printf("$ wg set wg0 peer %s preshared-key /dev/stdin <<< \"%s\"\n", serverWGPub, pskB64)
+
+	fmt.Println("\n--- WireGuard Kernel Handshake Mechanics (Noise_IKpsk2) ---")
+	fmt.Println("1. Classical: WireGuard kernel performs 4x X25519 ECDH (es, ss, ee, se).")
+	fmt.Println("2. Quantum:   Kernel executes mixKey(psk) injecting ML-KEM PSK into chaining key:")
+	fmt.Println("              Ck = BLAKE2s(Ck_classical || ML-KEM_PSK)")
+	fmt.Println("3. Result:    Hybrid tunnel security (unbroken unless BOTH X25519 AND ML-KEM fail).")
 
 	if *benchFlag {
 		fmt.Println("\nRunning benchmark (1,000 round-trips with ProvisionPSK + ConsumeProvisionedPSK)...")

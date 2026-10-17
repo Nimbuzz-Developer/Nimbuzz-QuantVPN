@@ -7,6 +7,7 @@ import (
 	"crypto/mlkem"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"sync"
@@ -731,6 +732,25 @@ func TestConcurrency(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// TestGenerateWireGuardKeypair verifies that standard WireGuard X25519 keypairs
+// are generated with correct 32-byte lengths and valid base64 encoding.
+func TestGenerateWireGuardKeypair(t *testing.T) {
+	privB64, pubB64, err := GenerateWireGuardKeypair()
+	if err != nil {
+		t.Fatalf("GenerateWireGuardKeypair failed: %v", err)
+	}
+
+	privBytes, err := base64.StdEncoding.DecodeString(privB64)
+	if err != nil || len(privBytes) != 32 {
+		t.Fatalf("invalid private key: len=%d, err=%v", len(privBytes), err)
+	}
+
+	pubBytes, err := base64.StdEncoding.DecodeString(pubB64)
+	if err != nil || len(pubBytes) != 32 {
+		t.Fatalf("invalid public key: len=%d, err=%v", len(pubBytes), err)
+	}
 }
 
 // Benchmarks

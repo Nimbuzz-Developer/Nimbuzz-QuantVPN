@@ -3,11 +3,13 @@
 package crypto
 
 import (
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/hkdf"
 	"crypto/mlkem"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -531,4 +533,16 @@ func DeriveKey(sharedSecret []byte) ([]byte, error) {
 		KDFLabel,
 		32,
 	)
+}
+
+// GenerateWireGuardKeypair creates a standard classical Curve25519 (X25519) keypair
+// formatted in standard WireGuard base64 encoding.
+func GenerateWireGuardKeypair() (privBase64, pubBase64 string, err error) {
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", fmt.Errorf("generate x25519 key: %w", err)
+	}
+	privB64 := base64.StdEncoding.EncodeToString(priv.Bytes())
+	pubB64 := base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes())
+	return privB64, pubB64, nil
 }

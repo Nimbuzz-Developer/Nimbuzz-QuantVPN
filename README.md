@@ -68,6 +68,33 @@ QuantVPN adds **NIST FIPS 203 ML-KEM-1024** (formerly Kyber-1024) to WireGuard. 
 - **Pure Go:** Uses Go's standard library `crypto/mlkem` package (standardized in NIST FIPS 203) and `golang.org/x/crypto/chacha20poly1305`. No C wrappers or foreign dependencies.
 - **Authenticated envelope & identity binding:** The client signs its ephemeral ML-KEM public key with its long-term Ed25519 identity key. The 1,629-byte envelope binds the client ID, server ID, session nonce, version, and KEM ciphertext into ChaCha20-Poly1305 as Additional Authenticated Data (AAD), preventing key substitution and replay attacks before decryption.
 
+### 2.1 Native WireGuard X25519 Hybrid Architecture
+
+WireGuard's creator (Jason A. Donenfeld) explicitly designed the `PresharedKey` parameter in the `Noise_IKpsk2` handshake pattern to allow post-quantum key encapsulation without modifying WireGuard's core protocol or kernel module.
+
+QuantVPN leverages this exact native mechanism:
+1. **Classical Layer (WireGuard Kernel):** WireGuard executes its native 4-way X25519 Diffie-Hellman handshake ($es, ss, ee, se$) across the client and server static and ephemeral keys to produce the classical chaining key $C_k^{\text{classical}}$.
+2. **Post-Quantum Layer (QuantVPN Control Plane):** QuantVPN negotiates an authenticated 256-bit PSK out-of-band via ML-KEM-1024 (NIST FIPS 203) and provisions it into the kernel interface via the WireGuard UAPI.
+3. **Hybrid KDF Mixing:** The WireGuard kernel natively executes `mixKey(psk)`, combining both classical and quantum-resistant secrets into the session chaining key using BLAKE2s:
+
+```ini
+# wg0-client.conf (Native WireGuard Config)
+[Interface]
+# Layer 1: Classical Native X25519 Key
+PrivateKey = <Client_Native_X25519_PrivateKey>
+Address = 10.0.0.2/32
+
+[Peer]
+# Layer 1: Classical Native X25519 Server Public Key
+PublicKey = <Server_Native_X25519_PublicKey>
+# Layer 2: Post-Quantum WireGuard PSK (derived via ML-KEM-1024)
+PresharedKey = <QuantVPN_ML-KEM-1024_PSK>
+Endpoint = 198.51.100.1:51820
+AllowedIPs = 0.0.0.0/0
+```
+
+Zero modifications are made to WireGuard's wire protocol. Standard UDP 51820 packets (148-byte handshakes, 1420 MTU limits, and hardware-accelerated kernel crypto) remain 100% intact.
+
 ---
 
 ## 3. Repository Structure
@@ -109,12 +136,14 @@ QuantVPN adds **NIST FIPS 203 ML-KEM-1024** (formerly Kyber-1024) to WireGuard. 
 - Go 1.24 or later (built and tested with Go 1.26).
 
 ### 4.2 Run the CLI Demo
+The interactive demo generates native WireGuard X25519 keypairs, performs the authenticated ML-KEM-1024 PSK negotiation, and outputs valid, production-ready WireGuard hybrid configurations:
+
 ```bash
 # Clone the repo with submodules
 git clone --recursive https://github.com/Nimbuzz-Developer/Nimbuzz-QuantVPN.git
 cd Nimbuzz-QuantVPN
 
-# Run the key exchange demo
+# Run the hybrid key exchange and configuration demo
 go run main.go
 
 # Run the built-in benchmark (~9,000+ operations/second)
